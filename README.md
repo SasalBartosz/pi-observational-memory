@@ -102,8 +102,11 @@ flowchart LR
   5. **Validate the outcome contract**: the report must match the batch id and account for
      every submitted timestamp exactly once. Worker exit code 0 alone is *not* success; a
      missing or invalid report leaves the whole batch active and retryable (no tombstone).
-  6. **Tombstone last** — only after validation, only observations still active on the
-     originating branch. Then INDEX.md is regenerated under the same lock.
+  6. **Regenerate INDEX.md under the same lock, then tombstone last** — the acknowledgement
+     lands only after validation *and* successful index generation, and only for
+     observations still active on the originating branch. A crash between the index write
+     and the tombstone leaves the batch active and retryable (the replay merges by batch
+     id); a failed index write means no tombstone at all.
 - **Promotion policy** (the consolidator's core rule): promote only *established current
   state, confirmed constraints, explicitly accepted decisions, durable conventions, and
   verified workarounds* — and only when the observations carry evidence for it. Speculation,

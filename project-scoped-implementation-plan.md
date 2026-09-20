@@ -273,13 +273,15 @@ Rework `dispatchConsolidator` in this order:
    (retryable), release the lock, report the failure. Replay of the same `batchId` must
    merge, not duplicate (the prompt instructs rewrite-in-place semantics; the archive
    write is idempotent by name).
-6. **Tombstone last.** Only after validation, and only tombstone submitted timestamps
+6. **Regenerate `INDEX.md` under the same lock, then tombstone last.** The acknowledgement
+   lands only after successful publication AND index generation — the proposal's explicit
+   ordering ("tombstone … after required files and the generated index have been written
+   successfully"; upstream wrote the index after tombstoning, which is precisely the
+   ordering the proposal flagged as needing attention). Only tombstone submitted timestamps
    still active on the originating branch (existing intersect-with-`stillActive` logic
    stays — it correctly protects forked branches and observations committed mid-run).
-   Then regenerate `INDEX.md` under the same lock (note: today the index write happens
-   after tombstoning; keep tombstone → index ordering but treat both as one critical
-   section; a crash between file writes and acknowledgement must be safely retryable, which
-   the batch-id replay covers).
+   Index → tombstone are one critical section: a crash between them leaves the batch active
+   and retryable, which the batch-id replay covers (idempotent merge).
 7. Release the lock in `finally`, after the worker process has exited.
 8. Session-identity check: capture `sessionId` at dispatch; at commit time verify
    `ctx.sessionManager.getSessionId()` still matches, else discard the run's ledger

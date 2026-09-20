@@ -25,11 +25,15 @@
  *      exactly once (no missing, no extras, no duplicates). Worker exit code 0 alone is NOT
  *      success. On missing/invalid outcomes the whole batch stays active (retryable — no
  *      tombstone), the lock is released, and the failure is reported.
- *   6. Tombstone last: only after validation, only submitted timestamps still active on the
+ *   6. INDEX.md is regenerated under the same lock, THEN the batch is tombstoned — the
+ *      acknowledgement lands only after successful publication AND index generation (the
+ *      proposal's explicit ordering; the reverse would make a post-tombstone index failure
+ *      or crash non-retryable). Tombstone only submitted timestamps still active on the
  *      originating branch (an observation an observer committed mid-run is not in the handed
- *      batch and must survive; forked branches keep their copies). Secret-screened timestamps
- *      join the tombstone set — they were never submitted but must drain too. Then INDEX.md
- *      is regenerated under the same lock; tombstone → index stay one critical section.
+ *      batch and must survive; forked branches keep their copies). Secret-screened
+ *      timestamps join the tombstone set — they were never submitted but must drain too.
+ *      Index → tombstone stay one critical section: a crash between them leaves the batch
+ *      active and retryable, and the replay merges by deterministic batch id.
  *   7. Release the lock in `finally`, after the worker process has exited.
  *   8. Session identity: the dispatching session id is captured up front and re-checked before
  *      ANY ledger commit — a session replacement between dispatch and commit must never land
@@ -419,7 +423,16 @@ export async function dispatchConsolidator(
 			throw new Error(`consolidator outcome validation failed: ${message}`);
 		}
 
-		// ── Steps 6 + 8: tombstone last — and only into the dispatching session's ledger.
+		// ── Steps 6 + 8: INDEX first, tombstone last — the acknowledgement (tombstone) lands
+		// only after successful publication AND index generation (the proposal's explicit
+		// ordering). INDEX regeneration is a project-scoped bank write — it belongs to the run
+		// even when the session identity changes. Index → tombstone stay one critical section
+		// under the lock: a crash between them leaves the batch active and retryable (the
+		// batch-id replay merges); the reverse order would drain the batch with a stale index.
+		atomicWrite(indexPath(runtime.projectDir), renderIndexFile(listTopics(runtime.projectDir, ctx.cwd)));
+		debugLog("consolidator.index", { runId, batchId });
+
+		// Tombstone — and only into the dispatching session's ledger.
 		let drained = 0;
 		let tombstoneSkipped = false;
 		if (ctx.sessionManager.getSessionId() !== dispatchSessionId) {
@@ -452,11 +465,6 @@ export async function dispatchConsolidator(
 			});
 		}
 
-		// INDEX regeneration is a project-scoped bank write — it belongs to the run even when
-		// the session identity changed. Tombstone → index stay one critical section under the
-		// lock; a crash between the two is covered by the batch-id replay (idempotent merge).
-		atomicWrite(indexPath(runtime.projectDir), renderIndexFile(listTopics(runtime.projectDir, ctx.cwd)));
-
 		runtime.status.workerDone(runId, drained);
 		runtime.refreshFooterGauges(ctx.sessionManager.getBranch(), ctx.getContextUsage?.()?.tokens ?? null);
 		if (ctx.hasUI && ctx.ui) {
@@ -474,8 +482,10 @@ export async function dispatchConsolidator(
 		if (ctx.hasUI) ctx.ui?.notify(`om: consolidator failed: ${message}`, "error");
 		return { outcome: "failed", archivePath: archiveRelPath, error: message };
 	} finally {
-		// Step 7: release the lock after the worker has exited. Idempotent: abortAllWorkers()
-		// may already have released (and cleared the field) on /om off or session replacement;
+		// Step 7: release the lock after the worker has exited. This finally is the ONLY
+		// release site: abortAllWorkers() (/om off, session replacement, shutdown) aborts the
+		// worker but deliberately leaves the release to run here, after the worker's close
+		// event — the lock is never freed while a worker we spawned may still write.
 		// releaseProjectLock itself is owner-checked and never throws.
 		runtime.releaseConsolidatorLock();
 		runtime.consolidatorController = undefined;

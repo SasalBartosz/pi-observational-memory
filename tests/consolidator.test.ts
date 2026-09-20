@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -401,6 +401,81 @@ describe("dispatchConsolidator (§7d ordering)", () => {
 		expect(foldLedger(h.branch).activeObservations).toHaveLength(3);
 		// Project-scoped bank writes belong to the run regardless of session identity.
 		expect(existsSync(indexPath(h.runtime.projectDir))).toBe(true);
+		expect(inspectProjectLock(h.runtime.projectDir)).toBeUndefined();
+		expect(h.runtime.consolidatorInFlight).toBe(false);
+	});
+
+	it("regenerates INDEX.md BEFORE the tombstone — the acknowledgement lands only after successful index generation", async () => {
+		const h = makeHarness();
+		let indexAtTombstone: string | undefined;
+		const baseAppendEntry = h.pi.appendEntry;
+		h.pi.appendEntry = (customType: string, data: unknown) => {
+			if (customType === OM_OBSERVATIONS_DROPPED) {
+				indexAtTombstone = existsSync(indexPath(h.runtime.projectDir))
+					? readFileSync(indexPath(h.runtime.projectDir), "utf-8")
+					: undefined;
+			}
+			baseAppendEntry(customType, data);
+		};
+		queueFakeWorker({
+			onRun: ({ env }) => {
+				// The worker's bank write — INDEX regeneration must pick it up before the tombstone.
+				writeFileSync(
+					join(env.OM_MEMORY_DIR ?? "", "fresh-topic.md"),
+					"---\nid: fresh-topic\ntitle: Fresh Topic\nsummary: written by the fake worker\n---\n\nbody\n",
+				);
+			},
+		});
+
+		const result = await dispatchConsolidator(h.pi, h.runtime, h.ctx, h.observations);
+
+		expect(result.outcome).toBe("completed");
+		// At the moment the tombstone (acknowledgement) was committed, INDEX.md already existed
+		// and included the worker's fresh topic. A crash between the two leaves the batch active
+		// and retryable; the reverse order would acknowledge with a stale or missing index.
+		expect(indexAtTombstone).toContain("fresh-topic.md");
+	});
+
+	it("index regeneration failure → no tombstone: the batch stays active and retryable", async () => {
+		const h = makeHarness();
+		// Make the INDEX write fail: an INDEX.md DIRECTORY makes the temp+rename throw.
+		mkdirSync(join(h.runtime.projectDir, "INDEX.md"), { recursive: true });
+		queueFakeWorker();
+
+		const result = await dispatchConsolidator(h.pi, h.runtime, h.ctx, h.observations);
+
+		expect(result.outcome).toBe("failed");
+		expect(droppedEntry(h.branch)).toBeUndefined();
+		expect(foldLedger(h.branch).activeObservations).toHaveLength(3);
+		expect(inspectProjectLock(h.runtime.projectDir)).toBeUndefined();
+	});
+
+	it("abortAllWorkers aborts the worker but does NOT release the lock — the dispatch's finally releases it after the exit", async () => {
+		const h = makeHarness();
+		let workerStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			workerStarted = resolve;
+		});
+		spawnMock.mockImplementationOnce(async (opts) => {
+			workerStarted();
+			return await new Promise<{ code: number | null; signal: NodeJS.Signals | null; stderr: string }>((resolve) => {
+				opts.signal?.addEventListener("abort", () => resolve({ code: null, signal: "SIGTERM", stderr: "" }));
+			});
+		});
+
+		const run = dispatchConsolidator(h.pi, h.runtime, h.ctx, h.observations);
+		h.runtime.consolidatorInFlight = true; // the caller's guard, as in evaluateConsolidatorTrigger
+		await started; // the lock is held and the (fake) worker is "running"
+
+		h.runtime.abortAllWorkers();
+		// Synchronously after the abort (the worker's close event has not been processed yet):
+		// the lock must STILL be held and the in-flight flag still set — freeing the lock now
+		// would let another consolidator start while the dying worker may still write.
+		expect(inspectProjectLock(h.runtime.projectDir)?.sessionId).toBe("sess-1");
+		expect(h.runtime.consolidatorInFlight).toBe(true);
+
+		const result = await run; // the abort resolves the worker → the dispatch's finally releases
+		expect(result.outcome).toBe("failed");
 		expect(inspectProjectLock(h.runtime.projectDir)).toBeUndefined();
 		expect(h.runtime.consolidatorInFlight).toBe(false);
 	});

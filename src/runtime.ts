@@ -54,11 +54,11 @@ export class Runtime {
 	consolidatorInFlight = false;
 	consolidatorController: AbortController | undefined;
 	/**
-	 * The cross-process project lock held by the in-flight consolidator, if any (plan §4). Kept
-	 * here so `/om off` and session replacement can abort the worker and then release the lock
-	 * in that order (never release while the worker may still write). `releaseConsolidatorLock()`
-	 * is idempotent: it clears the field first, so a later release from the dispatch's own
-	 * `finally` (or vice versa) is a safe no-op.
+	 * The cross-process project lock held by the in-flight consolidator, if any (plan §4). The
+	 * ONLY release site is the dispatch's own `finally`, which runs after the worker's close
+	 * event — never while a worker we spawned may still write. `abortAllWorkers()` aborts the
+	 * worker but deliberately does not release here. `releaseConsolidatorLock()` is
+	 * idempotent: it clears the field first, so a second release is a safe no-op.
 	 */
 	consolidatorLock: LockHandle | undefined;
 
@@ -198,14 +198,16 @@ export class Runtime {
 			controller.abort();
 		}
 		this.observersInFlight.clear();
-		// Order matters (§4): abort the consolidator worker FIRST, then release the project lock
-		// only if we still hold it — never the other way around, and never while a worker we
-		// spawned is guaranteed live. The dispatch's own `finally` also releases; whichever runs
-		// first wins the field, the other is a no-op.
+		// §4: abort the consolidator worker — but do NOT release the project lock or clear the
+		// in-flight flag here. The lock may only be freed once the worker has actually exited;
+		// the dispatch's own `finally` does exactly that (spawnWorker resolves on the process's
+		// close event, after SIGTERM/SIGKILL) and resets the flag. Releasing now would open a
+		// window where another process — or a re-enabled trigger in this one — acquires the
+		// lock and consolidates while the dying worker may still write. If the whole process
+		// exits before that close event, the lock file is left behind and reported stale for
+		// manual cleanup — the designed-for failure mode, unlike a double writer.
 		this.consolidatorController?.abort();
 		this.consolidatorController = undefined;
-		this.releaseConsolidatorLock();
-		this.consolidatorInFlight = false;
 	}
 
 	/**
