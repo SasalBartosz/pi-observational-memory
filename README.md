@@ -199,7 +199,6 @@ Namespace `observational-memory` in `~/.pi/agent/settings.json` (global) or
 {
   "observational-memory": {
     "chunkTokens": 10000,                // raw-history token size of one observation chunk
-    "chunkOverlapTokens": 0,             // overlap between adjacent chunks (0 in v1)
     "poolTargetTokens": 10000,           // buffer drains back toward this after consolidation
     "consolidateAtPoolTokens": 15000,    // pool size that triggers a consolidation
     "compactAtContextTokens": 150000,    // live context usage that triggers compaction

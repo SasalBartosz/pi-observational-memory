@@ -3,12 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import { observationToLine, renderSummary, sortObservations } from "../src/ledger/index.js";
 import { observation } from "./fixtures/session.js";
-import {
-	PROJECT_MEMORY_DIR,
-	renderBootstrapBlock,
-	renderIndexFile,
-	renderMemoryMap,
-} from "../src/memory/index-render.js";
+import { PROJECT_MEMORY_DIR, renderBootstrapBlock, renderIndexFile } from "../src/memory/index-render.js";
 import type { Topic } from "../src/memory/paths.js";
 import { estimateStringTokens } from "../src/tokens.js";
 
@@ -125,22 +120,6 @@ describe("renderIndexFile", () => {
 	});
 });
 
-describe("renderMemoryMap", () => {
-	it("returns undefined when there are no topics", () => {
-		expect(renderMemoryMap([])).toBeUndefined();
-	});
-
-	it("renders topic lines with no updated suffix, framed as possibly-stale reference", () => {
-		const map = renderMemoryMap([topic(), topic({ id: "deploy", title: "Deploy", summary: "fly.io", filename: "deploy.md", path: join(".memory", "project", "deploy.md") })]);
-		expect(map).toContain("## Memory map");
-		expect(map).toContain("`.memory/project/auth.md` — JWT and sessions");
-		expect(map).toContain("`.memory/project/deploy.md` — fly.io");
-		expect(map).toContain(`${PROJECT_MEMORY_DIR}/`);
-		expect(map).toContain("Possibly-stale");
-		expect(map).not.toContain("updated");
-	});
-});
-
 describe("renderBootstrapBlock", () => {
 	it("returns undefined when the bank is empty", () => {
 		expect(renderBootstrapBlock(undefined, [], 2_000)).toBeUndefined();
@@ -192,11 +171,5 @@ describe("renderBootstrapBlock", () => {
 		expect(block).not.toContain("`.memory/project/t29.md`");
 		expect(block).toContain("Full index");
 		expect(estimateStringTokens(block)).toBeLessThanOrEqual(150 + 2);
-	});
-
-	it("renders the shared topic-line format the memory map uses", () => {
-		const block = renderBootstrapBlock(undefined, [topic()], 2_000)!;
-		const map = renderMemoryMap([topic()])!;
-		expect(block).toContain(map.split("\n").find((l) => l.startsWith("- "))!);
 	});
 });

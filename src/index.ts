@@ -18,6 +18,7 @@ import { registerCompactionHook } from "./hooks/compaction-hook.js";
 import { registerCompactionTrigger } from "./hooks/compaction-trigger.js";
 import { registerConsolidatorTrigger } from "./hooks/consolidator-trigger.js";
 import { registerObserverTrigger } from "./hooks/observer-trigger.js";
+import { setDebugLogContext } from "./debug-log.js";
 import { OM_ENABLED, type Entry } from "./ledger/index.js";
 import { Runtime } from "./runtime.js";
 import { classifyProcessRole, registerSubagentStubs } from "./subagent-guard.js";
@@ -68,6 +69,7 @@ export default function observationalMemory(pi: ExtensionAPI): void {
 		// Capture the three storage roots at activation, always derived from ctx.cwd + the
 		// session id — never from a worker's cwd.
 		runtime.activatePaths(ctx);
+		setDebugLogContext({ enabled: runtime.config.debugLog, cwd: ctx.cwd, sessionId: runtime.sessionId });
 		const branch = ctx.sessionManager.getBranch() as Entry[];
 		runtime.enabled = readGateFromLedger(branch);
 		attachIfEnabled(ctx);
@@ -93,6 +95,7 @@ export default function observationalMemory(pi: ExtensionAPI): void {
 			pi.appendEntry(OM_ENABLED, { enabled: next });
 			if (next) {
 				runtime.activatePaths(ctx);
+				setDebugLogContext({ enabled: runtime.config.debugLog, cwd: ctx.cwd, sessionId: runtime.sessionId });
 				attachIfEnabled(ctx);
 				runtime.refreshFooterGauges(ctx.sessionManager.getBranch() as Entry[], ctx.getContextUsage?.()?.tokens ?? null);
 				runtime.refreshCost(ctx.sessionManager.getEntries() as Entry[]);

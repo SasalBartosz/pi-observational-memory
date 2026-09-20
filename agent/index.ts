@@ -27,6 +27,7 @@ import { CONSOLIDATOR_SYSTEM } from "./consolidator/prompt.js";
 import { registerConsolidatorTools } from "./consolidator/tools.js";
 import { OBSERVER_SYSTEM } from "./observer/prompt.js";
 import { registerObserverTool } from "./observer/tool.js";
+import { fail, ok, type ToolText } from "./tool-text.js";
 
 const DISPOSITIONS = ["promoted", "retained", "discarded"] as const;
 const DISPOSITION_SET = new Set<string>(DISPOSITIONS);
@@ -49,15 +50,6 @@ const ReportConsolidationOutcomesSchema = Type.Object({
 });
 
 type ReportConsolidationOutcomesInput = Static<typeof ReportConsolidationOutcomesSchema>;
-type ToolText = { content: { type: "text"; text: string }[]; details: unknown };
-
-function ok(text: string, details: unknown = {}): ToolText {
-	return { content: [{ type: "text" as const, text }], details };
-}
-
-function fail(text: string): ToolText {
-	return { content: [{ type: "text" as const, text: `Error: ${text}` }], details: { error: true } };
-}
 
 /**
  * The consolidator's terminal tool (the outcome contract). Unlike the scoped file tools, it

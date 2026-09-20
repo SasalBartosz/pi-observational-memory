@@ -12,8 +12,6 @@ export interface ConfiguredModel {
 export interface Config {
 	/** Raw-history token size of one observation chunk (fixed boundary). */
 	chunkTokens: number;
-	/** Overlap between adjacent chunks; default 0 in v1. */
-	chunkOverlapTokens: number;
 	/** Target size of the active observation pool; the buffer drains back toward this after consolidation. */
 	poolTargetTokens: number;
 	/** Active-pool token count that triggers a consolidation (200% of target). */
@@ -54,7 +52,6 @@ export interface Config {
 
 export const DEFAULTS: Config = {
 	chunkTokens: 10_000,
-	chunkOverlapTokens: 0,
 	poolTargetTokens: 10_000,
 	consolidateAtPoolTokens: 15_000,
 	compactAtContextTokens: 150_000,
@@ -106,7 +103,6 @@ function normalizeSettingsConfig(value: Record<string, unknown>, base: Config): 
 	const normalized: Partial<Config> = {};
 	const numberKeys = [
 		"chunkTokens",
-		"chunkOverlapTokens",
 		"poolTargetTokens",
 		"consolidateAtPoolTokens",
 		"compactAtContextTokens",
@@ -119,8 +115,6 @@ function normalizeSettingsConfig(value: Record<string, unknown>, base: Config): 
 		const normalizedValue = positiveIntegerOrUndefined(value[key]);
 		if (normalizedValue !== undefined) normalized[key] = normalizedValue;
 	}
-	// chunkOverlapTokens may legitimately be 0.
-	if (value.chunkOverlapTokens === 0) normalized.chunkOverlapTokens = 0;
 	if (typeof value.resumeAfterMidRunCompaction === "boolean")
 		normalized.resumeAfterMidRunCompaction = value.resumeAfterMidRunCompaction;
 	if (typeof value.passive === "boolean") normalized.passive = value.passive;

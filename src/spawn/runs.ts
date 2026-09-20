@@ -11,8 +11,9 @@
  * periodically, but never while workers are live; session archives are not part of that
  * cleanup.
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { atomicWrite } from "../memory/paths.js";
 
 /** What the observer model emits, before the orchestrator re-derives precise timestamp-ids. */
 export type RawObservation = {
@@ -89,14 +90,6 @@ export function readWorkerCost(path: string): WorkerCostResult | undefined {
 	} catch {
 		return undefined;
 	}
-}
-
-/** Atomic write (temp + rename) so a reader never sees a half-written file. */
-export function atomicWrite(path: string, content: string): void {
-	mkdirSync(dirname(path), { recursive: true });
-	const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-	writeFileSync(tmp, content, "utf-8");
-	renameSync(tmp, path);
 }
 
 function isRawObservation(value: unknown): value is RawObservation {

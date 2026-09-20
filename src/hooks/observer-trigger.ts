@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { assignObservationTimestamps } from "../ids.js";
+import { assignObservationTimestamps, nextRunId } from "../ids.js";
 import { debugLog } from "../debug-log.js";
 import {
 	entryIndexForId,
@@ -17,15 +17,7 @@ import {
 import type { Runtime } from "../runtime.js";
 import { buildWorkerArgv, buildWorkerEnv, spawnWorker } from "../spawn/launch.js";
 import { readObserverResult, readWorkerCost, runCostPath, runResultPath } from "../spawn/runs.js";
-
-type TriggerCtx = {
-	hasUI: boolean;
-	ui?: { notify: (message: string, level?: "info" | "warning" | "error") => void };
-	sessionManager: { getBranch: () => Entry[]; getEntries: () => Entry[] };
-	getContextUsage?: () => { tokens: number | null } | undefined;
-};
-
-let runCounter = 0;
+import type { TriggerCtx } from "./trigger-ctx.js";
 
 /**
  * Record a finished worker's cost from pi's built-in metrics (best-effort, even on failure).
@@ -42,12 +34,6 @@ export function recordWorkerCost(
 	if (!cost) return;
 	pi.appendEntry(OM_COST, { costUsd: cost.costUsd, role, runId });
 	runtime.refreshCost(ctx.sessionManager.getEntries());
-}
-
-function nextRunId(): string {
-	runCounter += 1;
-	const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
-	return `obs-${stamp}-${process.pid}-${runCounter}`;
 }
 
 /** The later (by branch index) of two coverage markers; undefined when neither resolves. */
@@ -95,9 +81,7 @@ export function evaluateObserverTriggers(pi: ExtensionAPI, runtime: Runtime, ctx
 		if (slice.entries.length === 0 || !slice.coversUpToId) break;
 
 		runtime.dispatchedCoversUpToId = slice.coversUpToId;
-		runtime.trackObserverTask(
-			dispatchObserver(pi, runtime, { hasUI, ui, sessionManager, getContextUsage: ctx.getContextUsage }, slice),
-		);
+		runtime.trackObserverTask(dispatchObserver(pi, runtime, ctx, slice));
 		if (hasUI) startToastLines.push(`om: observer started (~${slice.tokens.toLocaleString()} tok)`);
 	}
 
@@ -111,12 +95,12 @@ async function dispatchObserver(
 	ctx: TriggerCtx,
 	slice: SourceSlice,
 ): Promise<void> {
-	const runId = nextRunId();
+	const runId = nextRunId("obs");
 	const controller = new AbortController();
 	const coversUpToId = slice.coversUpToId!;
 	runtime.observersInFlight.set(runId, { controller, coversUpToId });
 
-	const { text: chunkText } = serializeSourceAddressedBranchEntries(slice.entries);
+	const chunkText = serializeSourceAddressedBranchEntries(slice.entries);
 	const lastEntry = slice.entries.at(-1);
 
 	// Start toast is fired as a batch by evaluateObserverTriggers after the dispatch

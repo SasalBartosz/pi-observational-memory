@@ -17,16 +17,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Static } from "typebox";
 import { atomicWrite } from "../../src/memory/paths.js";
-
-type ToolText = { content: { type: "text"; text: string }[]; details: unknown };
-
-function ok(text: string, details: unknown = {}): ToolText {
-	return { content: [{ type: "text" as const, text }], details };
-}
-
-function fail(text: string): ToolText {
-	return { content: [{ type: "text" as const, text: `Error: ${text}` }], details: { error: true } };
-}
+import { fail, ok, type ToolText } from "../tool-text.js";
 
 /**
  * Resolve a requested path against the sandbox root, or return undefined if it escapes.

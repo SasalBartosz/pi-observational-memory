@@ -2,12 +2,10 @@
  * Deterministic rendering of the shared project bank (`.memory/project/`), from topic-file
  * front-matter.
  *
- * Three consumers, all model-free and throwaway (regenerated, never edited incrementally — so
+ * Two consumers, all model-free and throwaway (regenerated, never edited incrementally — so
  * the projection cannot decay):
  *   - renderIndexFile: the orchestrator-owned INDEX.md on disk, re-rendered after each
  *     consolidation so live `ls`/`grep` truth leads the pushed map.
- *   - renderMemoryMap: the "memory map" section, built live from disk and handed to
- *     renderSummary().
  *   - renderBootstrapBlock: the bounded orientation block — the single shared renderer for
  *     compaction orientation and new-session bootstrap, so the two never diverge.
  */
@@ -47,21 +45,6 @@ export function renderIndexFile(topics: Topic[]): string {
 		parts.push("");
 	}
 	return `${parts.join("\n").trimEnd()}\n`;
-}
-
-/**
- * The memory-map section: each topic's path + terse summary plus a thin orientation header —
- * enough for the master to know a file exists and decide whether to read it. Returns
- * undefined when there are no topics (renderSummary then omits the section entirely).
- */
-export function renderMemoryMap(topics: Topic[]): string | undefined {
-	if (topics.length === 0) return undefined;
-	const lines: string[] = [
-		"## Memory map",
-		`Possibly-stale reference material lives in \`${PROJECT_MEMORY_DIR}/\` — topic files written by earlier sessions, not freshly verified state. Read a file when a topic below looks relevant; these summaries are intentionally terse.`,
-	];
-	for (const topic of topics) lines.push(topicLine(topic));
-	return lines.join("\n");
 }
 
 /** Cut `text` to at most `tokenBudget` tokens (≈4 chars/token), snapped to a word boundary. */

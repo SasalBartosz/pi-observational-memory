@@ -10,7 +10,6 @@ import {
 	projectMemoryDir,
 	readOverview,
 	resolvePaths,
-	resolveWithinMemory,
 	sessionArchiveDir,
 	sessionRuntimeDir,
 } from "../src/memory/paths.js";
@@ -63,21 +62,7 @@ describe("three-root resolution", () => {
 	});
 });
 
-describe("resolveWithinMemory", () => {
-	it("resolves paths inside the project bank", () => {
-		const projectDir = projectMemoryDir(cwd);
-		expect(resolveWithinMemory(projectDir, "auth.md")).toBe(join(projectDir, "auth.md"));
-		expect(resolveWithinMemory(projectDir, ".memory/project/auth.md")).toBe(
-			join(projectDir, ".memory", "project", "auth.md"),
-		);
-	});
 
-	it("rejects paths that escape the bank", () => {
-		const projectDir = projectMemoryDir(cwd);
-		expect(resolveWithinMemory(projectDir, "../secret.txt")).toBeUndefined();
-		expect(resolveWithinMemory(projectDir, "../../etc/passwd")).toBeUndefined();
-	});
-});
 
 describe("parseFrontMatter", () => {
 	it("parses flat id/title/summary front-matter and returns the body", () => {

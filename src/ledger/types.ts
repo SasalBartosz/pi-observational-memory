@@ -212,27 +212,3 @@ export function isObservationsArchivedEntry(entry: Entry): entry is Entry & {
 	return entry.type === "custom" && entry.customType === OM_OBSERVATIONS_ARCHIVED && isObservationsArchivedData(entry.data);
 }
 
-export function buildObservationsRecordedData(
-	observations: Observation[],
-	coversUpToId: string,
-): ObservationsRecordedEntryData | undefined {
-	if (observations.length === 0 || !isNonEmptyString(coversUpToId)) return undefined;
-	return { observations, coversUpToId };
-}
-
-export function buildObservationsDroppedData(
-	observationTimestamps: string[],
-	coversUpToId: string,
-): ObservationsDroppedEntryData | undefined {
-	if (observationTimestamps.length === 0 || !isNonEmptyString(coversUpToId)) return undefined;
-	return { observationTimestamps, coversUpToId };
-}
-
-export function buildObservationsArchivedData(
-	batchId: string,
-	path: string,
-	timestamps: string[],
-): ObservationsArchivedEntryData | undefined {
-	if (timestamps.length === 0 || !isNonEmptyString(batchId) || !isNonEmptyString(path)) return undefined;
-	return { batchId, path, timestamps };
-}

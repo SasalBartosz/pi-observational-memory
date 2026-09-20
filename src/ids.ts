@@ -1,6 +1,19 @@
 import { estimateStringTokens } from "./tokens.js";
 import type { Observation } from "./ledger/types.js";
 
+let runCounter = 0;
+
+/**
+ * Monotonic worker run id: `<prefix>-<compact UTC timestamp>-<pid>-<counter>`. The counter
+ * makes ids unique within a process even for same-second runs; the pid keeps concurrent
+ * orchestrator processes apart.
+ */
+export function nextRunId(prefix: string): string {
+	runCounter += 1;
+	const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+	return `${prefix}-${stamp}-${process.pid}-${runCounter}`;
+}
+
 /** What the observer model emits: minute-resolution event time + single-line content. */
 export type ModelObservation = {
 	timestamp: string; // "YYYY-MM-DD HH:MM"

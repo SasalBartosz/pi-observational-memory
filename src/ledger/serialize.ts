@@ -18,15 +18,6 @@ export function nowTimestamp(): string {
 	return fmtLocal(new Date());
 }
 
-export const MAX_RECORD_CONTENT_CHARS = 10_000;
-
-export function truncateRecordContent(content: string): string {
-	if (content.length <= MAX_RECORD_CONTENT_CHARS) return content;
-	const head = content.slice(0, MAX_RECORD_CONTENT_CHARS);
-	const dropped = content.length - MAX_RECORD_CONTENT_CHARS;
-	return `${head} … [truncated ${dropped} chars]`;
-}
-
 function textAndPlaceholders(content: unknown, options: { includeThinking?: boolean } = {}): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "[non-text content omitted]";
@@ -68,7 +59,7 @@ function textOnly(content: unknown): string {
 		.join("\n");
 }
 
-export function serializeConversation(messages: Message[]): string {
+function serializeConversation(messages: Message[]): string {
 	return messages
 		.map((msg): string | null => {
 			const time = formatTimestamp(msg.timestamp);
@@ -89,7 +80,7 @@ export function serializeConversation(messages: Message[]): string {
 		.join("\n\n");
 }
 
-export type RenderableEntry = {
+type RenderableEntry = {
 	type: string;
 	id?: string;
 	timestamp?: string;
@@ -134,29 +125,22 @@ export function serializeBranchEntries(entries: RenderableEntry[]): string {
 	return blocks.join("\n\n");
 }
 
-export type SourceAddressedSerialization = {
-	text: string;
-	sourceEntryIds: string[];
-};
-
 function isSourceRenderableEntry(entry: RenderableEntry): boolean {
 	return entry.type === "message" || entry.type === "custom_message" || entry.type === "branch_summary";
 }
 
 /**
  * Serialize a slice of source entries into an observer prompt chunk, each block prefixed
- * with its source entry id. v1 observations carry no `sourceEntryIds`, but the labels keep
- * the chunk readable and let the orchestrator anchor timestamps to bounding source entries.
+ * with its source entry id. The labels keep the chunk readable and let the orchestrator
+ * anchor timestamps to bounding source entries.
  */
-export function serializeSourceAddressedBranchEntries(entries: RenderableEntry[]): SourceAddressedSerialization {
+export function serializeSourceAddressedBranchEntries(entries: RenderableEntry[]): string {
 	const blocks: string[] = [];
-	const sourceEntryIds: string[] = [];
 	for (const entry of entries) {
 		if (!entry.id || !isSourceRenderableEntry(entry)) continue;
 		const rendered = serializeBranchEntries([entry]);
 		if (!rendered.trim()) continue;
-		sourceEntryIds.push(entry.id);
 		blocks.push(`[Source entry id: ${entry.id}]\n${rendered}`);
 	}
-	return { text: blocks.join("\n\n"), sourceEntryIds };
+	return blocks.join("\n\n");
 }

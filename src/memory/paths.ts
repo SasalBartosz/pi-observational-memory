@@ -14,7 +14,7 @@
  * All writes are atomic (temp + rename) so a reader never sees a half-written file.
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative } from "node:path";
 
 export const INDEX_FILENAME = "INDEX.md";
 /**
@@ -111,20 +111,6 @@ export function atomicWrite(path: string, content: string): void {
 	const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
 	writeFileSync(tmp, content, "utf-8");
 	renameSync(tmp, path);
-}
-
-/**
- * Resolve a (possibly relative) path and confirm it stays inside the given root (the project
- * bank). Returns the absolute path, or undefined if it escapes the sandbox. The consolidator's
- * scoped tools reject any path outside the bank this way (design risk 6).
- */
-export function resolveWithinMemory(root: string, requestedPath: string): string | undefined {
-	const base = resolve(root);
-	const abs = resolve(base, requestedPath);
-	const rel = relative(base, abs);
-	if (rel === "" || rel === ".") return abs; // the bank root itself
-	if (rel.startsWith("..") || resolve(base, rel) !== abs) return undefined;
-	return abs;
 }
 
 export type TopicFrontMatter = {

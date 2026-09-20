@@ -61,26 +61,8 @@ import type { Runtime } from "../runtime.js";
 import { buildWorkerArgv, buildWorkerEnv, spawnWorker } from "../spawn/launch.js";
 import { consolidatorResultPath, readConsolidatorResult, type ConsolidatorRunResult } from "../spawn/runs.js";
 import { recordWorkerCost } from "./observer-trigger.js";
-
-type TriggerCtx = {
-	cwd: string;
-	hasUI: boolean;
-	ui?: { notify: (message: string, level?: "info" | "warning" | "error") => void };
-	sessionManager: {
-		getBranch: () => Entry[];
-		getEntries: () => Entry[];
-		getSessionId: () => string;
-	};
-	getContextUsage?: () => { tokens: number | null } | undefined;
-};
-
-let runCounter = 0;
-
-function nextRunId(): string {
-	runCounter += 1;
-	const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
-	return `cons-${stamp}-${process.pid}-${runCounter}`;
-}
+import { nextRunId } from "../ids.js";
+import type { TriggerCtx } from "./trigger-ctx.js";
 
 // ── Flush lock wait (plan §4/§8) ────────────────────────────────────────────────────────
 // The background path defers on a busy lock (a later threshold trigger re-fires). An explicit
@@ -326,7 +308,7 @@ export async function dispatchConsolidator(
 	promote: Observation[],
 	opts: DispatchConsolidatorOptions = {},
 ): Promise<ConsolidatorDispatchResult> {
-	const runId = nextRunId();
+	const runId = nextRunId("cons");
 	const controller = new AbortController();
 	runtime.consolidatorController = controller;
 	runtime.status.workerStart("consolidator", runId);
