@@ -13,12 +13,14 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerCompactCommand } from "./commands/compact.js";
 import { registerConsolidateCommand } from "./commands/consolidate.js";
 import { registerStatusCommand } from "./commands/status.js";
+import { registerBootstrapHook } from "./hooks/bootstrap.js";
 import { registerCompactionHook } from "./hooks/compaction-hook.js";
 import { registerCompactionTrigger } from "./hooks/compaction-trigger.js";
 import { registerConsolidatorTrigger } from "./hooks/consolidator-trigger.js";
 import { registerObserverTrigger } from "./hooks/observer-trigger.js";
 import { OM_ENABLED, type Entry } from "./ledger/index.js";
 import { Runtime } from "./runtime.js";
+import { classifyProcessRole, registerSubagentStubs } from "./subagent-guard.js";
 
 function readGateFromLedger(branch: Entry[]): boolean {
 	for (let i = branch.length - 1; i >= 0; i--) {
@@ -31,6 +33,19 @@ function readGateFromLedger(branch: Entry[]): boolean {
 }
 
 export default function observationalMemory(pi: ExtensionAPI): void {
+	// Suppression guards (plan §10), by environment marker ONLY — never by parentSession (a user
+	// fork is a legitimate main session). Must run before anything else so suppressed roles never
+	// create a Runtime, resolve memory dirs, or register handlers.
+	const role = classifyProcessRole();
+	if (role === "worker") return; // our own worker subprocesses: register nothing at all
+	if (role === "subagent") {
+		// Interactive subagent session: stub commands only. No gate restore (so an inherited
+		// `om.enabled` ledger entry from a forked parent cannot re-enable the pipeline), no
+		// triggers, no status UI.
+		registerSubagentStubs(pi);
+		return;
+	}
+
 	const runtime = new Runtime();
 
 	function attachIfEnabled(ctx: any): void {
@@ -94,6 +109,7 @@ export default function observationalMemory(pi: ExtensionAPI): void {
 	registerConsolidatorTrigger(pi, runtime);
 	registerCompactionTrigger(pi, runtime);
 	registerCompactionHook(pi, runtime);
+	registerBootstrapHook(pi, runtime);
 
 	registerStatusCommand(pi, runtime);
 	registerCompactCommand(pi, runtime);

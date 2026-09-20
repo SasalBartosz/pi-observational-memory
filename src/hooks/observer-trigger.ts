@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { assignObservationTimestamps } from "../ids.js";
+import { debugLog } from "../debug-log.js";
 import {
 	entryIndexForId,
 	foldLedger,
@@ -189,6 +190,50 @@ async function dispatchObserver(
 	} finally {
 		runtime.observersInFlight.delete(runId);
 	}
+}
+
+/**
+ * Flush tail observation (plan §8): run ONE observer over the remaining uncovered
+ * conversation — from the effective watermark to the branch tip — even when the remainder is
+ * below `chunkTokens`, so a short session still publishes everything before it ends. Reuses
+ * `selectSourceSlice` in its explicit `takeAllRemaining` mode (never a faked threshold).
+ *
+ * Awaits any in-flight observers FIRST (their commits advance the committed watermark, so
+ * the tail must be cut from the settled effective watermark), then dispatches a single normal
+ * observer — tracked like any other dispatch so compaction/other flushes can still wait on
+ * it — and awaits it to completion before returning.
+ *
+ * No-op (no dispatch) when nothing remains uncovered or the gates are closed. Gates are the
+ * caller's (the flush command) primary responsibility; the guards here make the helper safe
+ * to call directly.
+ */
+export async function flushObserverTail(pi: ExtensionAPI, runtime: Runtime, ctx: TriggerCtx): Promise<void> {
+	if (!runtime.enabled || runtime.config.passive) return;
+
+	// Settle in-flight observers first: their commits append to the branch asynchronously, so
+	// cutting the tail earlier could race those appends; once they settle, the effective
+	// watermark (committed coverage ∨ the in-memory dispatch marker) is stable and the tail
+	// slice covers exactly what no observer — running or finished — has taken.
+	await runtime.whenObserversIdle();
+
+	const branch = ctx.sessionManager.getBranch();
+	const watermarkId = effectiveWatermarkId(runtime, branch);
+	const slice = selectSourceSlice(branch, watermarkId, runtime.config.chunkTokens, { takeAllRemaining: true });
+	if (slice.entries.length === 0 || !slice.coversUpToId) {
+		debugLog("observer.flush.tail-skipped", { watermarkId });
+		return;
+	}
+
+	runtime.dispatchedCoversUpToId = slice.coversUpToId;
+	debugLog("observer.flush.tail", {
+		watermarkId,
+		coversUpToId: slice.coversUpToId,
+		entries: slice.entries.length,
+		tokens: slice.tokens,
+	});
+	const task = dispatchObserver(pi, runtime, ctx, slice);
+	runtime.trackObserverTask(task);
+	await task;
 }
 
 export function registerObserverTrigger(pi: ExtensionAPI, runtime: Runtime): void {

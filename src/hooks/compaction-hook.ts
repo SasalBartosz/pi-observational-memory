@@ -156,7 +156,7 @@ export function registerCompactionHook(pi: ExtensionAPI, runtime: Runtime): void
 				listTopics(runtime.projectDir, ctx.cwd),
 				runtime.config.bootstrapTokens,
 			);
-			const summary = renderSummary(undefined, orientation, projection.observations);
+			const summary = renderSummary(undefined, orientation, projection.observations, projection.archivedBatches);
 
 			return {
 				compaction: {

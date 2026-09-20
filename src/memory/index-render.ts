@@ -66,6 +66,7 @@ export function renderMemoryMap(topics: Topic[]): string | undefined {
 
 /** Cut `text` to at most `tokenBudget` tokens (≈4 chars/token), snapped to a word boundary. */
 function truncateToTokenBudget(text: string, tokenBudget: number): string {
+	if (tokenBudget <= 0) return ""; // degenerate budget: nothing fits, not even a partial word
 	const maxChars = tokenBudget * 4;
 	if (text.length <= maxChars) return text;
 	const cut = text.slice(0, Math.max(0, maxChars - 1));

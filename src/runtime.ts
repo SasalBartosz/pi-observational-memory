@@ -75,6 +75,20 @@ export class Runtime {
 	compactInFlight = false;
 	compactHookInFlight = false;
 
+	/**
+	 * Fingerprint of the bank content (overview + topics) at the last bootstrap injection (plan
+	 * §9). Per-session in-memory state, reset by `activatePaths()` on every activation —
+	 * session_start (fresh, resume, reload, forks) and `/om on` — so the first agent turn after
+	 * an activation injects once, then re-injects only when the bank content changes.
+	 */
+	lastBootstrapFingerprint: string | undefined;
+
+	/**
+	 * Signature of the last bootstrap read failure, so the warning notify does not repeat on
+	 * every agent turn while the bank stays unreadable (plan §9).
+	 */
+	lastBootstrapError: string | undefined;
+
 	/** Last worker error message, surfaced by /om:status. */
 	lastWorkerError: string | undefined;
 
@@ -146,6 +160,11 @@ export class Runtime {
 		this.projectDir = paths.projectDir;
 		this.archiveDir = paths.archiveDir;
 		this.runtimeDir = paths.runtimeDir;
+		// Reset the per-session bootstrap injection state (plan §9): a new activation means a
+		// new session context, so the next agent turn re-orients once even if the bank is
+		// unchanged. In-memory only — a plain /om off→on cycle re-injects once, by design.
+		this.lastBootstrapFingerprint = undefined;
+		this.lastBootstrapError = undefined;
 	}
 
 	/** Recompute the live footer gauges (next-observer + pool + context) from the current branch. */

@@ -54,7 +54,7 @@ import {
 } from "../ledger/index.js";
 import { debugLog } from "../debug-log.js";
 import { renderIndexFile } from "../memory/index-render.js";
-import { acquireProjectLock } from "../memory/lock.js";
+import { acquireProjectLock, inspectProjectLock, type LockHandle, type ProjectLockOwner } from "../memory/lock.js";
 import { atomicWrite, indexPath, listTopics, readOverview } from "../memory/paths.js";
 import { screenSecrets } from "../memory/secrets.js";
 import type { Runtime } from "../runtime.js";
@@ -80,6 +80,79 @@ function nextRunId(): string {
 	runCounter += 1;
 	const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
 	return `cons-${stamp}-${process.pid}-${runCounter}`;
+}
+
+// ── Flush lock wait (plan §4/§8) ────────────────────────────────────────────────────────
+// The background path defers on a busy lock (a later threshold trigger re-fires). An explicit
+// /om:consolidate --flush cannot defer — the user is waiting — so it retries acquisition with
+// a short delay under a total-time bound. The retry lives HERE (caller side), never in the
+// lock module, and never spawns a worker while waiting.
+
+/** Total budget an explicit flush waits for a foreign lock holder before reporting "busy". */
+export const FLUSH_LOCK_WAIT_TIMEOUT_MS = 60_000;
+/** Delay between lock acquisition attempts during a flush wait. */
+export const FLUSH_LOCK_RETRY_DELAY_MS = 1_500;
+
+export type FlushLockWaitOptions = {
+	/** Total wait budget; defaults to FLUSH_LOCK_WAIT_TIMEOUT_MS. */
+	timeoutMs?: number;
+	/** Delay between acquisition attempts; defaults to FLUSH_LOCK_RETRY_DELAY_MS. */
+	retryDelayMs?: number;
+	/** When aborted, the wait gives up (returns "busy") instead of acquiring — never spawns. */
+	signal?: AbortSignal;
+};
+
+function sleepCancellable(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve) => {
+		const timer = setTimeout(done, ms);
+		function done(): void {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", done);
+			resolve();
+		}
+		if (signal) {
+			if (signal.aborted) {
+				done();
+				return;
+			}
+			signal.addEventListener("abort", done, { once: true });
+		}
+	});
+}
+
+/**
+ * Bounded, cancellable project-lock acquisition for the explicit flush path: try immediately,
+ * then retry every `retryDelayMs` until `timeoutMs` elapses or the lock comes free. Returns
+ * "busy" on timeout/abort — the caller reports and exits WITHOUT spawning.
+ */
+export async function waitForProjectLock(
+	projectDir: string,
+	owner: ProjectLockOwner,
+	options: FlushLockWaitOptions = {},
+): Promise<LockHandle | "busy"> {
+	const timeoutMs = options.timeoutMs ?? FLUSH_LOCK_WAIT_TIMEOUT_MS;
+	const retryDelayMs = options.retryDelayMs ?? FLUSH_LOCK_RETRY_DELAY_MS;
+
+	let lock = acquireProjectLock(projectDir, owner);
+	if (lock !== "busy") return lock;
+
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() + retryDelayMs <= deadline) {
+		if (options.signal?.aborted) return "busy";
+		await sleepCancellable(retryDelayMs, options.signal);
+		if (options.signal?.aborted) return "busy";
+		lock = acquireProjectLock(projectDir, owner);
+		if (lock !== "busy") {
+			debugLog("consolidator.lock.wait-acquired", {
+				pid: owner.pid,
+				sessionId: owner.sessionId,
+				elapsedMs: timeoutMs - Math.max(0, deadline - Date.now()),
+			});
+			return lock;
+		}
+		debugLog("consolidator.lock.wait-retry", { pid: owner.pid, sessionId: owner.sessionId });
+	}
+	return "busy";
 }
 
 /**
@@ -195,6 +268,42 @@ export function evaluateConsolidatorTrigger(pi: ExtensionAPI, runtime: Runtime, 
 }
 
 /**
+ * What a dispatch did — the synchronous report an explicit flush needs (background callers
+ * ignore it). "completed" = the worker ran and its outcomes validated; "deferred" = the
+ * default single-try lock acquisition found the lock busy (background semantics); "lock-busy"
+ * = an injected lock waiter (flush) exhausted its bounded wait; "all-screened" = every
+ * observation looked secret, so the batch drained locally without a worker; "failed" = worker
+ * error or invalid outcomes (the batch stays active and retryable).
+ */
+export type ConsolidatorDispatchResult = {
+	outcome: "completed" | "deferred" | "lock-busy" | "all-screened" | "failed";
+	/** Archive path recorded in the om.observations.archived entry (relative to cwd), once archived. */
+	archivePath?: string;
+	/** Worker-validated dispositions for the submitted batch ("completed" only). */
+	counts?: { promoted: number; retained: number; discarded: number };
+	/** Secret-screened observations: never submitted; drained as discarded. */
+	screened?: number;
+	/** Observations actually tombstoned on the dispatching branch. */
+	drained?: number;
+	/** The session was replaced mid-run: bank writes landed, the ledger tombstone was skipped. */
+	tombstoneSkipped?: boolean;
+	/** Error message ("failed" only). */
+	error?: string;
+	/** inspectProjectLock() status for the holder, e.g. "held by pid X (session Y)" ("deferred"/"lock-busy"). */
+	lockMessage?: string;
+};
+
+export type DispatchConsolidatorOptions = {
+	/**
+	 * Lock acquisition strategy, injected so the flush path can wait without changing the
+	 * background behavior. Default: one non-blocking try — busy means silent defer (a later
+	 * threshold trigger re-fires). The flush path injects `waitForProjectLock` (bounded,
+	 * cancellable retry; busy means the explicit command reports and exits).
+	 */
+	acquireLock?: (projectDir: string, owner: ProjectLockOwner) => LockHandle | "busy" | Promise<LockHandle | "busy">;
+};
+
+/**
  * Tombstone the given timestamps, intersected with what is still active on the branch, and
  * return how many actually drained. Never tombstones something already dropped, and never
  * something an observer committed during the run (those are not in the handed batch).
@@ -215,7 +324,8 @@ export async function dispatchConsolidator(
 	runtime: Runtime,
 	ctx: TriggerCtx,
 	promote: Observation[],
-): Promise<void> {
+	opts: DispatchConsolidatorOptions = {},
+): Promise<ConsolidatorDispatchResult> {
 	const runId = nextRunId();
 	const controller = new AbortController();
 	runtime.consolidatorController = controller;
@@ -225,6 +335,11 @@ export async function dispatchConsolidator(
 	// session's ledger — exactly the session it belongs to — so it needs no guard; only the
 	// post-spawn tombstone must not land in a replacement session's ledger.
 	const dispatchSessionId = runtime.sessionId;
+	// Kept outside the try so a failure result can still tell the caller where the batch was
+	// archived (archive-before-drain means the file survives a failed run — it is the retry).
+	let archiveRelPath: string | undefined;
+	// The lock owner handed to the (possibly injected) acquisition strategy.
+	const lockOwner: ProjectLockOwner = { pid: process.pid, sessionId: dispatchSessionId, runId };
 
 	try {
 		// ── Step 1: archive first, before anything is drained. ─────────────────────────
@@ -238,13 +353,13 @@ export async function dispatchConsolidator(
 			const drained = tombstoneStillActive(pi, ctx, screened.map((o) => o.timestamp));
 			debugLog("consolidator.batch-all-screened", { runId, drained });
 			runtime.status.workerDone(runId, drained);
-			return;
+			return { outcome: "all-screened", drained, screened: screened.length };
 		}
 
 		const batchId = deriveBatchId(dispatchSessionId, safe.map((o) => o.timestamp));
 		const archivePath = join(runtime.archiveDir, `${batchId}.json`);
 		atomicWrite(archivePath, `${JSON.stringify({ batchId, observations: safe }, null, "\t")}\n`);
-		const archiveRelPath = relative(ctx.cwd, archivePath) || archivePath;
+		archiveRelPath = relative(ctx.cwd, archivePath) || archivePath;
 		const submittedTimestamps = safe.map((o) => o.timestamp);
 		pi.appendEntry(OM_OBSERVATIONS_ARCHIVED, { batchId, path: archiveRelPath, timestamps: submittedTimestamps });
 		debugLog("consolidator.archive", {
@@ -256,22 +371,27 @@ export async function dispatchConsolidator(
 		});
 
 		// ── Step 2: project lock before reading the bank or building the prompt. ────────
-		const lock = acquireProjectLock(runtime.projectDir, {
-			pid: process.pid,
-			sessionId: dispatchSessionId,
-			runId,
-		});
+		// Default (background): one non-blocking try — busy defers silently (no retry loop, no
+		// spawn; the batch stays active and retryable, a later threshold trigger re-fires, and
+		// the archive write above is idempotent by name). The flush path injects a bounded,
+		// cancellable waiter instead; for it, busy means the wait timed out — surfaced as
+		// "lock-busy" so the explicit command can report the holder and exit without spawning.
+		const lock = await (opts.acquireLock
+			? opts.acquireLock(runtime.projectDir, lockOwner)
+			: acquireProjectLock(runtime.projectDir, lockOwner));
 		if (lock === "busy") {
-			// Background dispatch defers: no retry loop, no spawn (never spawn while the lock
-			// is held elsewhere). The batch stays active and retryable; a later threshold
-			// trigger re-fires. The archive write above is idempotent by name, so a replay
-			// of this batch merges rather than duplicates.
-			debugLog("consolidator.lock.busy", { runId, batchId });
-			if (ctx.hasUI) {
-				ctx.ui?.notify("om: consolidation deferred — the project memory lock is held by another process", "info");
+			const lockMessage = inspectProjectLock(runtime.projectDir)?.message ?? "held by another process";
+			debugLog("consolidator.lock.busy", { runId, batchId, flush: opts.acquireLock !== undefined, lockMessage });
+			if (!opts.acquireLock) {
+				// Background dispatch defers (info-level notice at most).
+				if (ctx.hasUI) {
+					ctx.ui?.notify("om: consolidation deferred — the project memory lock is held by another process", "info");
+				}
+				runtime.status.workerDone(runId, 0);
+				return { outcome: "deferred", archivePath: archiveRelPath, lockMessage };
 			}
 			runtime.status.workerDone(runId, 0);
-			return;
+			return { outcome: "lock-busy", archivePath: archiveRelPath, lockMessage };
 		}
 		runtime.consolidatorLock = lock;
 
@@ -319,6 +439,7 @@ export async function dispatchConsolidator(
 
 		// ── Steps 6 + 8: tombstone last — and only into the dispatching session's ledger.
 		let drained = 0;
+		let tombstoneSkipped = false;
 		if (ctx.sessionManager.getSessionId() !== dispatchSessionId) {
 			// The session was replaced while the worker ran (resume into a new session,
 			// session_start with a different id). Appending the tombstone now would drain the
@@ -334,6 +455,7 @@ export async function dispatchConsolidator(
 			if (ctx.hasUI) {
 				ctx.ui?.notify("om: consolidator finished after a session switch — tombstone skipped", "info");
 			}
+			tombstoneSkipped = true;
 		} else {
 			// Submitted + secret-screened (never submitted, but they must drain too).
 			drained = tombstoneStillActive(pi, ctx, [...safe, ...screened].map((o) => o.timestamp));
@@ -362,11 +484,13 @@ export async function dispatchConsolidator(
 				ctx.ui.notify.bind(ctx.ui),
 			);
 		}
+		return { outcome: "completed", archivePath: archiveRelPath, counts, screened: screened.length, drained, tombstoneSkipped };
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		runtime.lastWorkerError = message;
 		runtime.status.workerError(runId);
 		if (ctx.hasUI) ctx.ui?.notify(`om: consolidator failed: ${message}`, "error");
+		return { outcome: "failed", archivePath: archiveRelPath, error: message };
 	} finally {
 		// Step 7: release the lock after the worker has exited. Idempotent: abortAllWorkers()
 		// may already have released (and cleared the field) on /om off or session replacement;

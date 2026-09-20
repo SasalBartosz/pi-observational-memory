@@ -158,6 +158,16 @@ export type SourceSlice = {
 	tokens: number;
 };
 
+export type SourceSliceOptions = {
+	/**
+	 * Flush mode (plan §8): take EVERY source entry after the watermark up to the branch tip,
+	 * ignoring the token budget — the explicit "take whatever remains" slice for the end-of-task
+	 * tail observation. This is a real selection mode, not a faked threshold (the caller never
+	 * inflates `chunkTokens` to get here).
+	 */
+	takeAllRemaining?: boolean;
+};
+
 /**
  * Select the next observation chunk: the source entries strictly after `afterEntryId`
  * (the latest covered watermark), accumulated until adding the next entry would exceed
@@ -168,9 +178,15 @@ export type SourceSlice = {
  * call whose result is a separate, later entry. When the token budget is reached but the next
  * entry is a tool result, the slice keeps extending past the budget until it reaches an entry
  * that may legitimately start the next chunk — so tool calls and their results always stay in
- * the same chunk.
+ * the same chunk. With `options.takeAllRemaining` the budget check is skipped entirely and the
+ * slice runs to the branch tip (flush tail).
  */
-export function selectSourceSlice(entries: Entry[], afterEntryId: string | undefined, chunkTokens: number): SourceSlice {
+export function selectSourceSlice(
+	entries: Entry[],
+	afterEntryId: string | undefined,
+	chunkTokens: number,
+	options: SourceSliceOptions = {},
+): SourceSlice {
 	const startIndex = afterEntryId ? entryIndexForId(entries, afterEntryId) : -1;
 	const slice: Entry[] = [];
 	let tokens = 0;
@@ -183,7 +199,7 @@ export function selectSourceSlice(entries: Entry[], afterEntryId: string | undef
 		// Break only when over budget AND `entry` could legitimately start the next chunk.
 		// If `entry` is a tool result, breaking here would orphan it from its tool call in the
 		// previous chunk, so keep extending instead.
-		if (slice.length > 0 && tokens + entryTokens > chunkTokens && isValidCutPoint(entry)) break;
+		if (!options.takeAllRemaining && slice.length > 0 && tokens + entryTokens > chunkTokens && isValidCutPoint(entry)) break;
 		slice.push(entry);
 		tokens += entryTokens;
 		coversUpToId = entry.id;
