@@ -23,11 +23,17 @@ export interface Config {
 	/** Verbatim raw tail kept after the cutoff; snaps to a chunk boundary. */
 	tailTokens: number;
 	/**
-	 * Target size of `.memory/JOURNEY.md`, the running descriptive project history the
-	 * consolidator appends to and pushes into every compaction block. When the file grows past
-	 * this, the consolidator compresses its oldest entries (recent history stays detailed).
+	 * Target size of `.memory/project/OVERVIEW.md` — the undated current-state orientation the
+	 * consolidator rewrites wholesale and every orientation block carries. Not a running
+	 * history: no dated segments, no append-mostly compression.
 	 */
-	journeyTargetTokens: number;
+	overviewTargetTokens: number;
+	/**
+	 * Hard combined read-time cap for the injected OVERVIEW + index orientation block — the
+	 * same bounded block compaction and new-session bootstrap render, so the two never
+	 * diverge. Truncated content is replaced by a full-index pointer.
+	 */
+	bootstrapTokens: number;
 	/** Max simultaneous in-flight observer subprocesses. */
 	observerConcurrency: number;
 	models: {
@@ -53,7 +59,8 @@ export const DEFAULTS: Config = {
 	consolidateAtPoolTokens: 15_000,
 	compactAtContextTokens: 150_000,
 	tailTokens: 20_000,
-	journeyTargetTokens: 1_000,
+	overviewTargetTokens: 1_000,
+	bootstrapTokens: 2_000,
 	observerConcurrency: 4,
 	resumeAfterMidRunCompaction: true,
 	models: {
@@ -104,7 +111,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>, base: Config): 
 		"consolidateAtPoolTokens",
 		"compactAtContextTokens",
 		"tailTokens",
-		"journeyTargetTokens",
+		"overviewTargetTokens",
+		"bootstrapTokens",
 		"observerConcurrency",
 	] as const;
 	for (const key of numberKeys) {

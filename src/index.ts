@@ -2,8 +2,8 @@
  * Observational memory — ORCHESTRATOR (master-side, in-process).
  *
  * The conductor: owns the clocks/triggers, spawns subprocess workers, commits their output to
- * the ledger (observations) or files (long-term, Phase B), renders compaction, and drives the
- * TUI. Event-driven only — no daemon.
+ * the ledger (observations) or the shared project bank (INDEX/OVERVIEW/topics), renders
+ * compaction, and drives the TUI. Event-driven only — no daemon.
  *
  * Ships in the global extensions folder during development, so it is gated OFF by default per
  * session (A2a). When the gate is off, every handler returns at its first line and the
@@ -18,7 +18,6 @@ import { registerCompactionTrigger } from "./hooks/compaction-trigger.js";
 import { registerConsolidatorTrigger } from "./hooks/consolidator-trigger.js";
 import { registerObserverTrigger } from "./hooks/observer-trigger.js";
 import { OM_ENABLED, type Entry } from "./ledger/index.js";
-import { ensureSessionMemory } from "./memory/session.js";
 import { Runtime } from "./runtime.js";
 
 function readGateFromLedger(branch: Entry[]): boolean {
@@ -45,9 +44,17 @@ export default function observationalMemory(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event: unknown, ctx: any) => {
 		runtime.ensureConfig(ctx.cwd);
 		runtime.dispatchedCoversUpToId = undefined;
+		// Session replacement: a different session id means any in-flight workers belong to
+		// the old session — abort them before re-resolving so an old run never commits into
+		// the new session's ledger.
+		if (runtime.sessionId !== "" && runtime.sessionId !== ctx.sessionManager.getSessionId()) {
+			runtime.abortAllWorkers();
+		}
+		// Capture the three storage roots at activation, always derived from ctx.cwd + the
+		// session id — never from a worker's cwd.
+		runtime.activatePaths(ctx);
 		const branch = ctx.sessionManager.getBranch() as Entry[];
 		runtime.enabled = readGateFromLedger(branch);
-		if (runtime.enabled) runtime.memoryRoot = ensureSessionMemory(ctx);
 		attachIfEnabled(ctx);
 		runtime.refreshFooterGauges(branch, ctx.getContextUsage?.()?.tokens ?? null);
 		runtime.refreshCost(ctx.sessionManager.getEntries() as Entry[]);
@@ -70,7 +77,7 @@ export default function observationalMemory(pi: ExtensionAPI): void {
 			runtime.enabled = next;
 			pi.appendEntry(OM_ENABLED, { enabled: next });
 			if (next) {
-				runtime.memoryRoot = ensureSessionMemory(ctx);
+				runtime.activatePaths(ctx);
 				attachIfEnabled(ctx);
 				runtime.refreshFooterGauges(ctx.sessionManager.getBranch() as Entry[], ctx.getContextUsage?.()?.tokens ?? null);
 				runtime.refreshCost(ctx.sessionManager.getEntries() as Entry[]);

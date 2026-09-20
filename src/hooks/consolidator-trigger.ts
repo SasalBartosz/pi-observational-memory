@@ -1,8 +1,8 @@
 /**
- * Phase B consolidator clock. When the active observation pool crosses
- * `consolidateAtPoolTokens`, promote the oldest observations (above `poolTargetTokens`) into
- * durable `.memory/` topic files via a subprocess consolidator, then tombstone exactly the
- * timestamps it reports back.
+ * Consolidator clock. When the active observation pool crosses `consolidateAtPoolTokens`,
+ * promote the oldest observations (above `poolTargetTokens`) into durable
+ * `.memory/project/` topic files via a subprocess consolidator, then tombstone exactly the
+ * batch it was handed.
  *
  * Runs in the BACKGROUND, mirroring the observer trigger (turn_end / agent_start), strictly
  * one at a time (design risk 4). Compaction does not wait for it (R5).
@@ -15,6 +15,7 @@
  * buffer always drains; a flaked-out partial run is recoverable from the worker's global session
  * recording (the standing safety net for lossy rewrites) and is the critic tier's job to catch.
  */
+import { mkdirSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	OM_OBSERVATIONS_DROPPED,
@@ -27,14 +28,14 @@ import {
 	type Entry,
 	type Observation,
 } from "../ledger/index.js";
-import { nowTimestamp } from "../ledger/serialize.js";
 import { renderIndexFile } from "../memory/index-render.js";
-import { atomicWrite, indexPath, listTopics, readJourney } from "../memory/paths.js";
+import { atomicWrite, indexPath, listTopics, readOverview } from "../memory/paths.js";
 import type { Runtime } from "../runtime.js";
 import { buildWorkerArgv, buildWorkerEnv, spawnWorker } from "../spawn/launch.js";
 import { recordWorkerCost } from "./observer-trigger.js";
 
 type TriggerCtx = {
+	cwd: string;
 	hasUI: boolean;
 	ui?: { notify: (message: string, level?: "info" | "warning" | "error") => void };
 	sessionManager: { getBranch: () => Entry[]; getEntries: () => Entry[] };
@@ -50,31 +51,37 @@ function nextRunId(): string {
 }
 
 /**
- * Build the consolidator's `-p` prompt: current time + current index + current journey + the
- * overflow lines. The journey is included verbatim so the consolidator updates it in place
- * (append a segment for this batch; compress the old tail only if over `journeyTargetTokens`).
+ * Build the consolidator's `-p` prompt: current index + current overview + the overflow
+ * lines. The overview is included verbatim so the consolidator rewrites it in place
+ * (wholesale, undated — never a dated running history). Nothing in the prompt or the bank
+ * carries timestamps; front matter is exactly id/title/summary.
  */
-function buildConsolidatorPrompt(memoryRoot: string, promote: Observation[], journeyTargetTokens: number): string {
-	const indexText = renderIndexFile(listTopics(memoryRoot));
-	const journeyText = readJourney(memoryRoot);
-	const journeyWords = Math.round((journeyTargetTokens * 3) / 4);
+function buildConsolidatorPrompt(
+	projectDir: string,
+	cwd: string,
+	promote: Observation[],
+	overviewTargetTokens: number,
+): string {
+	const indexText = renderIndexFile(listTopics(projectDir, cwd));
+	const overviewText = readOverview(projectDir);
+	const overviewWords = Math.round((overviewTargetTokens * 3) / 4);
 	const obsLines = sortObservations(promote).map(observationToLine).join("\n");
 	return (
-		`Current local time: ${nowTimestamp()}\n\n` +
-		"You are folding the observations below into the durable topic files under .memory/. " +
-		"Use this exact time string in the `updated` front-matter of any file you write, and in any new JOURNEY.md entry.\n\n" +
+		"You are folding the observations below into the durable topic files under .memory/project/. " +
+		"Front matter is exactly id/title/summary — no dates or timestamps anywhere in the bank.\n\n" +
 		"===== CURRENT MEMORY INDEX (generated; do not edit INDEX.md) =====\n" +
 		`${indexText}\n` +
 		"===== END MEMORY INDEX =====\n\n" +
-		"===== CURRENT JOURNEY (.memory/JOURNEY.md — the running descriptive project history) =====\n" +
-		`${journeyText ?? "(empty — no journey yet; start one)"}\n` +
-		"===== END JOURNEY =====\n\n" +
+		"===== CURRENT OVERVIEW (.memory/project/OVERVIEW.md — undated current-state orientation) =====\n" +
+		`${overviewText ?? "(empty — no overview yet; start one)"}\n` +
+		"===== END OVERVIEW =====\n\n" +
 		"===== OBSERVATIONS TO CONSOLIDATE (each line is `<timestamp-id>  <content>`) =====\n" +
 		`${obsLines}\n` +
 		"===== END OBSERVATIONS =====\n\n" +
 		"Fold every observation above into topic files (create/merge/rewrite as needed). Then update " +
-		`.memory/JOURNEY.md per your instructions — keep it under ~${journeyTargetTokens} tokens (~${journeyWords} words), ` +
-		"purely descriptive, no advice or next steps. Finish with a one-sentence confirmation."
+		`.memory/project/OVERVIEW.md per your instructions — keep it under ~${overviewTargetTokens} tokens ` +
+		`(~${overviewWords} words), undated current-state orientation: no advice or next steps. ` +
+		"Finish with a one-sentence confirmation."
 	);
 }
 
@@ -110,14 +117,26 @@ async function dispatchConsolidator(
 	runtime.status.workerStart("consolidator", runId);
 
 	try {
-		const prompt = buildConsolidatorPrompt(runtime.memoryRoot, promote, runtime.config.journeyTargetTokens);
+		// The worker's scoped `ls`/`read` tools expect the sandbox root to exist; the shared bank
+		// is otherwise created lazily by its first durable write.
+		mkdirSync(runtime.projectDir, { recursive: true });
+		const prompt = buildConsolidatorPrompt(
+			runtime.projectDir,
+			ctx.cwd,
+			promote,
+			runtime.config.overviewTargetTokens,
+		);
 		const argv = buildWorkerArgv({
 			model: runtime.config.models.consolidator,
 			sessionName: `om-consolidator-${runId}`,
 			kickoffPrompt: prompt,
 		});
-		const env = buildWorkerEnv("consolidator", { memoryRoot: runtime.memoryRoot, runId });
-		const exit = await spawnWorker({ argv, cwd: runtime.memoryRoot, env, signal: controller.signal });
+		const env = buildWorkerEnv("consolidator", {
+			runtimeDir: runtime.runtimeDir,
+			projectDir: runtime.projectDir,
+			runId,
+		});
+		const exit = await spawnWorker({ argv, cwd: runtime.runtimeDir, env, signal: controller.signal });
 		// Capture cost before the exit-code check so a partial run's spend is still recorded.
 		recordWorkerCost(pi, runtime, ctx, "consolidator", runId);
 		if (exit.code !== 0) {
@@ -139,7 +158,7 @@ async function dispatchConsolidator(
 		}
 
 		// Re-render INDEX.md so live ls/grep truth leads the pushed map (design risk 3).
-		atomicWrite(indexPath(runtime.memoryRoot), renderIndexFile(listTopics(runtime.memoryRoot)));
+		atomicWrite(indexPath(runtime.projectDir), renderIndexFile(listTopics(runtime.projectDir, ctx.cwd)));
 
 		runtime.status.workerDone(runId, toDrop.length);
 		runtime.refreshFooterGauges(ctx.sessionManager.getBranch(), ctx.getContextUsage?.()?.tokens ?? null);

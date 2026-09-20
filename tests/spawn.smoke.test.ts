@@ -4,7 +4,16 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { AGENT_EXTENSION_PATH, buildWorkerArgv, buildWorkerEnv, modelArg } from "../src/spawn/launch.js";
-import { readObserverResult, runResultPath, runsDir, writeObserverResult } from "../src/spawn/runs.js";
+import {
+	consolidatorResultPath,
+	readConsolidatorResult,
+	readObserverResult,
+	runCostPath,
+	runResultPath,
+	runsDir,
+	writeConsolidatorResult,
+	writeObserverResult,
+} from "../src/spawn/runs.js";
 import { registerObserverTool } from "../agent/observer/tool.js";
 
 describe("launch argv + env", () => {
@@ -34,19 +43,92 @@ describe("launch argv + env", () => {
 		expect(modelArg(model)).toBe("anthropic/claude-sonnet-4-6");
 	});
 
-	it("sets the worker IPC env vars", () => {
-		const memoryRoot = "/proj/.memory/sess-1";
-		const env = buildWorkerEnv("observer", { memoryRoot, runId: "r1" });
+	it("splits the worker IPC env by role: observer gets runtime-dir IPC only", () => {
+		const runtimeDir = "/proj/.memory/runtime/sess-1";
+		const env = buildWorkerEnv("observer", { runtimeDir, runId: "r1" });
 		expect(env.OM_WORKER).toBe("observer");
 		expect(env.OM_RUN_ID).toBe("r1");
 		// Chunk travels as the `pi -p` prompt (recorded user message), not via env/file.
 		expect(env.OM_CHUNK_PATH).toBeUndefined();
-		expect(env.OM_RESULT_PATH).toBe(runResultPath(memoryRoot, "r1"));
-		expect(env.OM_MEMORY_DIR).toBe(memoryRoot);
+		expect(env.OM_RESULT_PATH).toBe(runResultPath(runtimeDir, "r1"));
+		expect(env.OM_COST_PATH).toBe(runCostPath(runtimeDir, "r1"));
+		// The observer has no file tools — no sandbox root is handed out.
+		expect(env.OM_MEMORY_DIR).toBeUndefined();
 	});
 
-	it("resolves run paths under the session memory root's .runs", () => {
-		expect(runsDir("/proj/.memory/sess-1")).toBe("/proj/.memory/sess-1/.runs");
+	it("gives the consolidator the shared bank as OM_MEMORY_DIR, IPC under the runtime dir", () => {
+		const runtimeDir = "/proj/.memory/runtime/sess-1";
+		const projectDir = "/proj/.memory/project";
+		const env = buildWorkerEnv("consolidator", { runtimeDir, projectDir, runId: "c1" });
+		expect(env.OM_WORKER).toBe("consolidator");
+		expect(env.OM_MEMORY_DIR).toBe(projectDir);
+		// The consolidator's result file is the outcome contract, still under the runtime dir.
+		expect(env.OM_RESULT_PATH).toBe(consolidatorResultPath(runtimeDir, "c1"));
+		expect(env.OM_COST_PATH).toBe(runCostPath(runtimeDir, "c1"));
+	});
+
+	it("refuses a consolidator without the shared-bank sandbox root", () => {
+		expect(() => buildWorkerEnv("consolidator", { runtimeDir: "/proj/.memory/runtime/sess-1", runId: "c1" })).toThrow();
+	});
+
+	it("resolves run paths under the session runtime dir's runs/ (outside the durable bank)", () => {
+		expect(runsDir("/proj/.memory/runtime/sess-1")).toBe("/proj/.memory/runtime/sess-1/runs");
+		expect(runResultPath("/proj/.memory/runtime/sess-1", "r")).toBe(
+			"/proj/.memory/runtime/sess-1/runs/r.result.json",
+		);
+		expect(consolidatorResultPath("/proj/.memory/runtime/sess-1", "c")).toBe(
+			"/proj/.memory/runtime/sess-1/runs/c.consolidation.json",
+		);
+	});
+});
+
+describe("consolidator result IPC round-trip", () => {
+	let dir: string;
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "om-cons-ipc-"));
+	});
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("writes and reads back a validated outcome report", () => {
+		const path = join(dir, "c1.consolidation.json");
+		writeConsolidatorResult(path, {
+			batchId: "batch-1",
+			outcomes: [
+				{ timestamp: "2026-06-25T14:30:00", disposition: "promoted" },
+				{ timestamp: "2026-06-25T14:31:00", disposition: "retained" },
+				{ timestamp: "2026-06-25T14:32:00", disposition: "discarded" },
+			],
+		});
+		const result = readConsolidatorResult(path);
+		expect(result.batchId).toBe("batch-1");
+		expect(result.outcomes).toEqual([
+			{ timestamp: "2026-06-25T14:30:00", disposition: "promoted" },
+			{ timestamp: "2026-06-25T14:31:00", disposition: "retained" },
+			{ timestamp: "2026-06-25T14:32:00", disposition: "discarded" },
+		]);
+	});
+
+	it("throws on a missing batchId", () => {
+		const path = join(dir, "bad1.consolidation.json");
+		writeFileSync(path, JSON.stringify({ outcomes: [] }));
+		expect(() => readConsolidatorResult(path)).toThrow("batchId");
+	});
+
+	it("throws on a missing outcomes array", () => {
+		const path = join(dir, "bad2.consolidation.json");
+		writeFileSync(path, JSON.stringify({ batchId: "b" }));
+		expect(() => readConsolidatorResult(path)).toThrow("outcomes");
+	});
+
+	it("throws on a malformed outcome entry (no silent filtering)", () => {
+		const path = join(dir, "bad3.consolidation.json");
+		writeFileSync(
+			path,
+			JSON.stringify({ batchId: "b", outcomes: [{ timestamp: "t", disposition: "nope" }] }),
+		);
+		expect(() => readConsolidatorResult(path)).toThrow("malformed outcome");
 	});
 });
 

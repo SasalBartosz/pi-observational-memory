@@ -37,7 +37,7 @@ export function recordWorkerCost(
 	role: "observer" | "consolidator",
 	runId: string,
 ): void {
-	const cost = readWorkerCost(runCostPath(runtime.memoryRoot, runId));
+	const cost = readWorkerCost(runCostPath(runtime.runtimeDir, runId));
 	if (!cost) return;
 	pi.appendEntry(OM_COST, { costUsd: cost.costUsd, role, runId });
 	runtime.refreshCost(ctx.sessionManager.getEntries());
@@ -149,15 +149,15 @@ async function dispatchObserver(
 			sessionName: `om-observer-${runId}`,
 			kickoffPrompt: userText,
 		});
-		const env = buildWorkerEnv("observer", { memoryRoot: runtime.memoryRoot, runId });
-		const exit = await spawnWorker({ argv, cwd: runtime.memoryRoot, env, signal: controller.signal });
+		const env = buildWorkerEnv("observer", { runtimeDir: runtime.runtimeDir, runId });
+		const exit = await spawnWorker({ argv, cwd: runtime.runtimeDir, env, signal: controller.signal });
 		// Capture cost before the exit-code check so a partial run's spend is still recorded.
 		recordWorkerCost(pi, runtime, ctx, "observer", runId);
 		if (exit.code !== 0) {
 			throw new Error(`observer exited with code ${exit.code}${exit.stderr ? `: ${exit.stderr.trim().slice(0, 200)}` : ""}`);
 		}
 
-		const result = readObserverResult(runResultPath(runtime.memoryRoot, runId));
+		const result = readObserverResult(runResultPath(runtime.runtimeDir, runId));
 		const branch = ctx.sessionManager.getBranch();
 		const used = foldLedger(branch).observationsByTimestamp.keys();
 		const observations = assignObservationTimestamps(result.observations, {

@@ -1,12 +1,15 @@
 /**
- * The consolidator's tool belt. `--no-builtin-tools` is set on the worker, so this extension
- * registers its own read/write/edit/ls/grep — all path-scoped to `.memory/` (design risk 6).
- * There is no result file: the file edits ARE the output, and the run ends by natural exit
- * of `pi -p` once the model emits its closing confirmation. The orchestrator then tombstones
- * the whole provided batch (it already knows exactly what it handed over).
+ * The consolidator's file tool belt. `--no-builtin-tools` is set on the worker, so this
+ * extension registers its own read/write/edit/ls/grep — all path-scoped to the shared
+ * project bank (design risk 6). The bank edits are half the output; the run's other half
+ * is the outcome report, handled by the dedicated tool in agent/index.ts that writes OUTSIDE
+ * this sandbox (to OM_RESULT_PATH in the transient runtime dir).
  *
- * Scoping: every path argument is resolved against OM_MEMORY_DIR and rejected if it escapes
- * that directory, so a wayward model cannot read or clobber the user's project.
+ * Scoping: every path argument is resolved against OM_MEMORY_DIR (the shared bank) and
+ * rejected if it escapes that directory, so a wayward model cannot read or clobber the
+ * user's project. INDEX.md is generated (writes to it are rejected), and dotfiles —
+ * `.consolidation.lock` and any replay metadata — are orchestrator-owned and rejected in
+ * every tool; ls/grep additionally skip them when listing/searching.
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
@@ -25,33 +28,40 @@ function fail(text: string): ToolText {
 	return { content: [{ type: "text" as const, text: `Error: ${text}` }], details: { error: true } };
 }
 
-/** Resolve a requested path against the sandbox root, or return undefined if it escapes. */
-function scoped(root: string, requested: string): string | undefined {
+/**
+ * Resolve a requested path against the sandbox root, or return undefined if it escapes.
+ * Returns both the absolute path and its bank-relative form (used for the guards below).
+ */
+function scoped(root: string, requested: string): { abs: string; rel: string } | undefined {
 	const abs = resolve(root, requested);
 	const rel = relative(root, abs);
-	if (rel === "") return abs;
 	if (rel.startsWith("..")) return undefined;
-	return abs;
+	return { abs, rel };
+}
+
+/** True when any path segment is a dotfile (`.consolidation.lock`, replay metadata, temp files). */
+function isHiddenPath(rel: string): boolean {
+	return rel.split("/").some((segment) => segment.startsWith("."));
 }
 
 const ReadSchema = Type.Object({
-	path: Type.String({ description: "Path inside .memory/, e.g. 'auth.md' or '.memory/auth.md'." }),
+	path: Type.String({ description: "Path inside the memory bank, e.g. 'auth.md' or 'OVERVIEW.md'." }),
 });
 const WriteSchema = Type.Object({
-	path: Type.String({ description: "Path inside .memory/ to (over)write, e.g. 'auth.md'." }),
+	path: Type.String({ description: "Path inside the memory bank to (over)write, e.g. 'auth.md'." }),
 	content: Type.String({ description: "Full file content, including YAML front-matter." }),
 });
 const EditSchema = Type.Object({
-	path: Type.String({ description: "Path inside .memory/ to edit." }),
+	path: Type.String({ description: "Path inside the memory bank to edit." }),
 	oldText: Type.String({ description: "Exact text to replace (must occur exactly once)." }),
 	newText: Type.String({ description: "Replacement text." }),
 });
 const LsSchema = Type.Object({
-	path: Type.Optional(Type.String({ description: "Subdirectory inside .memory/. Defaults to .memory/ root." })),
+	path: Type.Optional(Type.String({ description: "Subdirectory inside the memory bank. Defaults to the bank root." })),
 });
 const GrepSchema = Type.Object({
 	pattern: Type.String({ description: "JavaScript regular expression to search for." }),
-	path: Type.Optional(Type.String({ description: "Restrict to this file/subdir inside .memory/." })),
+	path: Type.Optional(Type.String({ description: "Restrict to this file/subdir inside the memory bank." })),
 });
 
 type ReadInput = Static<typeof ReadSchema>;
@@ -63,7 +73,7 @@ type GrepInput = Static<typeof GrepSchema>;
 function listFilesRecursive(dir: string): string[] {
 	const out: string[] = [];
 	for (const name of readdirSync(dir)) {
-		if (name.startsWith(".")) continue; // skip .runs and temp files
+		if (name.startsWith(".")) continue; // skip dotfiles: lock, replay metadata, temp files
 		const full = join(dir, name);
 		if (statSync(full).isDirectory()) out.push(...listFilesRecursive(full));
 		else out.push(full);
@@ -71,33 +81,42 @@ function listFilesRecursive(dir: string): string[] {
 	return out;
 }
 
-/** Register the consolidator's scoped file tools (read/write/edit/ls/grep), all under .memory/. */
+/**
+ * Register the consolidator's scoped file tools (read/write/edit/ls/grep), all confined to
+ * the shared project bank. INDEX.md and dotfiles (`.consolidation.lock`, replay metadata)
+ * are orchestrator-owned: writes to them are rejected, and ls/grep never list them.
+ */
 export function registerConsolidatorTools(pi: ExtensionAPI, memoryRoot: string): void {
 	const root = resolve(memoryRoot);
+
+	const HIDDEN_ERROR =
+		"hidden files (dotfiles such as .consolidation.lock) are orchestrator-managed; do not read, write, or edit them";
 
 	pi.registerTool({
 		name: "read",
 		label: "Read memory file",
-		description: "Read a topic file under .memory/.",
+		description: "Read a file in the memory bank (topic file or OVERVIEW.md).",
 		parameters: ReadSchema,
 		async execute(_id: string, params: ReadInput): Promise<ToolText> {
-			const abs = scoped(root, params.path);
-			if (!abs) return fail("path escapes .memory/");
-			if (!existsSync(abs)) return fail(`no such file: ${params.path}`);
-			return ok(readFileSync(abs, "utf-8"));
+			const p = scoped(root, params.path);
+			if (!p) return fail("path escapes the memory bank");
+			if (isHiddenPath(p.rel)) return fail(HIDDEN_ERROR);
+			if (!existsSync(p.abs)) return fail(`no such file: ${params.path}`);
+			return ok(readFileSync(p.abs, "utf-8"));
 		},
 	});
 
 	pi.registerTool({
 		name: "write",
 		label: "Write memory file",
-		description: "Create or overwrite a topic file under .memory/ (atomic). Do not write INDEX.md.",
+		description: "Create or overwrite a file in the memory bank (atomic). Do not write INDEX.md.",
 		parameters: WriteSchema,
 		async execute(_id: string, params: WriteInput): Promise<ToolText> {
-			const abs = scoped(root, params.path);
-			if (!abs) return fail("path escapes .memory/");
-			if (/(^|\/)INDEX\.md$/i.test(params.path)) return fail("INDEX.md is generated automatically; do not write it");
-			atomicWrite(abs, params.content);
+			const p = scoped(root, params.path);
+			if (!p) return fail("path escapes the memory bank");
+			if (/(^|\/)INDEX\.md$/i.test(p.rel)) return fail("INDEX.md is generated automatically; do not write it");
+			if (isHiddenPath(p.rel)) return fail(HIDDEN_ERROR);
+			atomicWrite(p.abs, params.content);
 			return ok(`Wrote ${params.path} (${params.content.length} bytes).`);
 		},
 	});
@@ -105,18 +124,19 @@ export function registerConsolidatorTools(pi: ExtensionAPI, memoryRoot: string):
 	pi.registerTool({
 		name: "edit",
 		label: "Edit memory file",
-		description: "Replace an exact substring in a topic file under .memory/ (atomic).",
+		description: "Replace an exact substring in a file in the memory bank (atomic). Do not edit INDEX.md.",
 		parameters: EditSchema,
 		async execute(_id: string, params: EditInput): Promise<ToolText> {
-			const abs = scoped(root, params.path);
-			if (!abs) return fail("path escapes .memory/");
-			if (/(^|\/)INDEX\.md$/i.test(params.path)) return fail("INDEX.md is generated automatically; do not edit it");
-			if (!existsSync(abs)) return fail(`no such file: ${params.path}`);
-			const current = readFileSync(abs, "utf-8");
+			const p = scoped(root, params.path);
+			if (!p) return fail("path escapes the memory bank");
+			if (/(^|\/)INDEX\.md$/i.test(p.rel)) return fail("INDEX.md is generated automatically; do not edit it");
+			if (isHiddenPath(p.rel)) return fail(HIDDEN_ERROR);
+			if (!existsSync(p.abs)) return fail(`no such file: ${params.path}`);
+			const current = readFileSync(p.abs, "utf-8");
 			const occurrences = current.split(params.oldText).length - 1;
 			if (occurrences === 0) return fail("oldText not found");
 			if (occurrences > 1) return fail(`oldText is ambiguous (${occurrences} matches); add more context`);
-			atomicWrite(abs, current.replace(params.oldText, params.newText));
+			atomicWrite(p.abs, current.replace(params.oldText, params.newText));
 			return ok(`Edited ${params.path}.`);
 		},
 	});
@@ -124,13 +144,14 @@ export function registerConsolidatorTools(pi: ExtensionAPI, memoryRoot: string):
 	pi.registerTool({
 		name: "ls",
 		label: "List memory files",
-		description: "List files under .memory/.",
+		description: "List files in the memory bank (dotfiles are hidden).",
 		parameters: LsSchema,
 		async execute(_id: string, params: LsInput): Promise<ToolText> {
-			const abs = scoped(root, params.path ?? ".");
-			if (!abs) return fail("path escapes .memory/");
-			if (!existsSync(abs)) return ok("(.memory/ is empty)");
-			const entries = readdirSync(abs).filter((n) => !n.startsWith("."));
+			const p = scoped(root, params.path ?? ".");
+			if (!p) return fail("path escapes the memory bank");
+			if (isHiddenPath(p.rel)) return fail(HIDDEN_ERROR);
+			if (!existsSync(p.abs)) return ok("(the memory bank is empty)");
+			const entries = readdirSync(p.abs).filter((n) => !n.startsWith("."));
 			return ok(entries.length > 0 ? entries.sort().join("\n") : "(empty)");
 		},
 	});
@@ -138,7 +159,7 @@ export function registerConsolidatorTools(pi: ExtensionAPI, memoryRoot: string):
 	pi.registerTool({
 		name: "grep",
 		label: "Search memory files",
-		description: "Search topic files under .memory/ with a regular expression.",
+		description: "Search files in the memory bank with a regular expression (dotfiles are skipped).",
 		parameters: GrepSchema,
 		async execute(_id: string, params: GrepInput): Promise<ToolText> {
 			let re: RegExp;
@@ -147,10 +168,11 @@ export function registerConsolidatorTools(pi: ExtensionAPI, memoryRoot: string):
 			} catch (e) {
 				return fail(`invalid regex: ${(e as Error).message}`);
 			}
-			const base = scoped(root, params.path ?? ".");
-			if (!base) return fail("path escapes .memory/");
-			if (!existsSync(base)) return ok("(no matches)");
-			const files = statSync(base).isDirectory() ? listFilesRecursive(base) : [base];
+			const p = scoped(root, params.path ?? ".");
+			if (!p) return fail("path escapes the memory bank");
+			if (isHiddenPath(p.rel)) return fail(HIDDEN_ERROR);
+			if (!existsSync(p.abs)) return ok("(no matches)");
+			const files = statSync(p.abs).isDirectory() ? listFilesRecursive(p.abs) : [p.abs];
 			const hits: string[] = [];
 			for (const file of files) {
 				const lines = readFileSync(file, "utf-8").split("\n");

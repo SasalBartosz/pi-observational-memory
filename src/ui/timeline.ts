@@ -10,7 +10,7 @@ import {
 
 /** Glyphs for the timeline strip. */
 const GLYPH = {
-	consolidated: "▓", // observations promoted to .memory (long-term)
+	consolidated: "▓", // observations promoted to .memory/project/ (shared bank)
 	partial: "▚", // chunk straddling the pool-target boundary (some obs promoted)
 	pool: "▒", // observed, still in the short-term buffer
 	raw: "░", // raw history not yet distilled into observations
@@ -67,7 +67,7 @@ function wrap(cells: string[], width: number): string {
 
 /**
  * Render the full session as a horizontal strip, one cell per ~`chunkTokens` of raw history:
- * the tiered pipeline reads left→right as consolidated (`.memory`) → pool → raw, with
+ * the tiered pipeline reads left→right as consolidated (`.memory/project/`) → pool → raw, with
  * compaction cutoffs overlaid and the live tip at the end. The live next-observer/pool token
  * gauges live in the footer status, not here.
  *
@@ -108,6 +108,6 @@ export function renderTimeline(branch: Entry[], config: Config, width = 60): str
 		`om timeline · 1 cell ≈ ${fmtK(config.chunkTokens)} tok · ${fmtK(rawTotal)} raw · ${compactions} compaction${compactions === 1 ? "" : "s"}`,
 		strip,
 		``,
-		`  ${GLYPH.consolidated} .memory (${consolidatedChunks})   ${GLYPH.pool} pool (${poolChunks})   ${GLYPH.raw} raw   ${GLYPH.cut} compaction cut   ${GLYPH.tip} tip`,
+		`  ${GLYPH.consolidated} .memory/project/ (${consolidatedChunks})   ${GLYPH.pool} pool (${poolChunks})   ${GLYPH.raw} raw   ${GLYPH.cut} compaction cut   ${GLYPH.tip} tip`,
 	].join("\n");
 }

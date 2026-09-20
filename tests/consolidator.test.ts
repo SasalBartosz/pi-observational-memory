@@ -7,25 +7,29 @@ import { registerConsolidatorTools } from "../agent/consolidator/tools.js";
 import { buildWorkerEnv } from "../src/spawn/launch.js";
 
 describe("buildWorkerEnv(consolidator)", () => {
-	it("sets role, run id, and the .memory sandbox root", () => {
-		const env = buildWorkerEnv("consolidator", { memoryRoot: "/proj/.memory/sess-1", runId: "c1" });
+	it("sets role, run id, and the shared-bank sandbox root", () => {
+		const env = buildWorkerEnv("consolidator", {
+			runtimeDir: "/proj/.memory/runtime/sess-1",
+			projectDir: "/proj/.memory/project",
+			runId: "c1",
+		});
 		expect(env.OM_WORKER).toBe("consolidator");
 		expect(env.OM_RUN_ID).toBe("c1");
-		expect(env.OM_MEMORY_DIR).toBe("/proj/.memory/sess-1");
+		expect(env.OM_MEMORY_DIR).toBe("/proj/.memory/project");
 	});
 });
 
 describe("registerConsolidatorTools (scoped to .memory/)", () => {
 	let cwd: string;
-	let memoryRoot: string;
+	let bankRoot: string;
 	let tools: Map<string, any>;
 
 	beforeEach(() => {
 		cwd = mkdtempSync(join(tmpdir(), "om-cons-tools-"));
-		memoryRoot = join(cwd, ".memory");
+		bankRoot = join(cwd, ".memory");
 		tools = new Map();
 		const fakePi = { registerTool: (def: any) => tools.set(def.name, def) } as any;
-		registerConsolidatorTools(fakePi, memoryRoot);
+		registerConsolidatorTools(fakePi, bankRoot);
 	});
 	afterEach(() => {
 		rmSync(cwd, { recursive: true, force: true });
@@ -38,7 +42,7 @@ describe("registerConsolidatorTools (scoped to .memory/)", () => {
 	it("write then read a topic file", async () => {
 		const res = await tools.get("write").execute("1", { path: "auth.md", content: "---\nid: auth\n---\nbody" });
 		expect(res.content[0].text).toContain("Wrote auth.md");
-		expect(readFileSync(join(memoryRoot, "auth.md"), "utf-8")).toContain("body");
+		expect(readFileSync(join(bankRoot, "auth.md"), "utf-8")).toContain("body");
 		const read = await tools.get("read").execute("2", { path: "auth.md" });
 		expect(read.content[0].text).toContain("body");
 	});
@@ -46,12 +50,12 @@ describe("registerConsolidatorTools (scoped to .memory/)", () => {
 	it("refuses to write or edit INDEX.md", async () => {
 		const w = await tools.get("write").execute("1", { path: "INDEX.md", content: "x" });
 		expect(w.content[0].text).toContain("generated automatically");
-		expect(existsSync(join(memoryRoot, "INDEX.md"))).toBe(false);
+		expect(existsSync(join(bankRoot, "INDEX.md"))).toBe(false);
 	});
 
 	it("rejects paths that escape .memory/", async () => {
 		const r = await tools.get("write").execute("1", { path: "../escape.md", content: "x" });
-		expect(r.content[0].text).toContain("escapes .memory/");
+		expect(r.content[0].text).toContain("escapes");
 		expect(existsSync(join(cwd, "escape.md"))).toBe(false);
 	});
 
@@ -61,7 +65,7 @@ describe("registerConsolidatorTools (scoped to .memory/)", () => {
 		expect(ambiguous.content[0].text).toContain("ambiguous");
 		const ok = await tools.get("edit").execute("3", { path: "t.md", oldText: "beta", newText: "BETA" });
 		expect(ok.content[0].text).toContain("Edited");
-		expect(readFileSync(join(memoryRoot, "t.md"), "utf-8")).toBe("alpha BETA alpha");
+		expect(readFileSync(join(bankRoot, "t.md"), "utf-8")).toBe("alpha BETA alpha");
 	});
 
 	it("ls and grep operate within .memory/", async () => {

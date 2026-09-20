@@ -11,7 +11,7 @@ import { mkdirSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import type { ConfiguredModel } from "../config.js";
-import { runCostPath, runResultPath } from "./runs.js";
+import { consolidatorResultPath, runCostPath, runResultPath } from "./runs.js";
 
 /** Repo root = two levels up from src/spawn/. The shared agent extension lives at agent/index.ts. */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -65,10 +65,11 @@ export type WorkerExit = { code: number | null; signal: NodeJS.Signals | null; s
 
 /**
  * Spawn a headless worker; resolve when it exits. Workers run in their master session's
- * `.memory/<sessionId>/` root (not the project cwd) so pi keys the run into a distinct global
- * session bucket and it never clutters the project's `/resume` picker. The root is ensured to
- * exist before spawn — `spawn()` would ENOENT otherwise (the memory root is created lazily on
- * first durable write when there is no parent to seed).
+ * runtime dir (`.memory/runtime/<sessionId>/`, not the project cwd) so pi keys the run into a
+ * distinct global session bucket and it never clutters the project's `/resume` picker. The
+ * purpose is unchanged from the old single-root layout — only the bucket moves out of the
+ * durable bank. The runtime dir is ensured to exist before spawn — `spawn()` would ENOENT
+ * otherwise (it is created lazily on first worker dispatch).
  */
 export function spawnWorker(opts: {
 	argv: string[];
@@ -104,26 +105,41 @@ export function spawnWorker(opts: {
 	});
 }
 
-export type ObserverLaunchEnv = {
-	/** Absolute `.memory/<sessionId>/` root — IPC files and the consolidator sandbox live here. */
-	memoryRoot: string;
+export type WorkerLaunchEnv = {
+	/** Absolute session runtime dir — the worker's result/cost IPC files land under its runs/. */
+	runtimeDir: string;
 	runId: string;
+	/** Consolidator role only: the shared project bank — the sandbox root for its scoped file tools. */
+	projectDir?: string;
 };
 
 /**
- * Build the env a worker subprocess needs to write its result file. The chunk itself is NOT
- * passed via env/file — it is the `pi -p` prompt (recorded user message) so the run stays
- * faithfully inspectable on resume.
+ * Build the env a worker subprocess needs, split by role. Both roles get their result/cost
+ * IPC paths under the session runtime dir (transient, outside the durable bank). Only the
+ * consolidator gets OM_MEMORY_DIR, pointing at the shared project bank — its sandbox is the
+ * bank and nothing else. The chunk itself is NOT passed via env/file — it is the `pi -p`
+ * prompt (recorded user message) so the run stays faithfully inspectable on resume.
  */
-export function buildWorkerEnv(role: "observer" | "consolidator", opts: ObserverLaunchEnv): NodeJS.ProcessEnv {
-	return {
+export function buildWorkerEnv(role: "observer" | "consolidator", opts: WorkerLaunchEnv): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = {
 		...process.env,
 		OM_WORKER: role,
 		OM_RUN_ID: opts.runId,
-		OM_RESULT_PATH: runResultPath(opts.memoryRoot, opts.runId),
+		// Result IPC lives under the runtime dir; the consolidator's result file is the
+		// validated-outcome contract (its own filename, same runs dir).
+		OM_RESULT_PATH:
+			role === "consolidator"
+				? consolidatorResultPath(opts.runtimeDir, opts.runId)
+				: runResultPath(opts.runtimeDir, opts.runId),
 		// Per-run cost handoff: the worker extension writes pi's built-in usage.cost.total here.
-		OM_COST_PATH: runCostPath(opts.memoryRoot, opts.runId),
-		// Sandbox root for the consolidator's scoped file tools (design risk 6).
-		OM_MEMORY_DIR: opts.memoryRoot,
+		OM_COST_PATH: runCostPath(opts.runtimeDir, opts.runId),
 	};
+	if (role === "consolidator") {
+		if (!opts.projectDir) {
+			throw new Error("consolidator worker requires projectDir (the shared-bank sandbox)");
+		}
+		// Sandbox root for the consolidator's scoped file tools (design risk 6).
+		env.OM_MEMORY_DIR = opts.projectDir;
+	}
+	return env;
 }

@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { renderMemoryMap } from "../memory/index-render.js";
-import { listTopics, readJourney } from "../memory/paths.js";
+import { renderBootstrapBlock } from "../memory/index-render.js";
+import { listTopics, readOverview } from "../memory/paths.js";
 import type { Runtime } from "../runtime.js";
 import {
 	buildCompactionProjection,
@@ -147,12 +147,16 @@ export function registerCompactionHook(pi: ExtensionAPI, runtime: Runtime): void
 
 			const snapped = snap.firstKeptId;
 			const projection = buildCompactionProjection(branch, snapped);
-			// Phase B: render the long-term tier live from disk, regenerated each compaction
-			// (throwaway projections — cannot decay). The journey is the running descriptive history
-			// the consolidator maintains; the map is the topic-file index.
-			const journey = readJourney(runtime.memoryRoot);
-			const map = renderMemoryMap(listTopics(runtime.memoryRoot));
-			const summary = renderSummary(journey, map, projection.observations);
+			// Render the long-term tier live from disk, regenerated each compaction (throwaway
+			// projections — cannot decay). The shared bounded orientation block is the SAME
+			// renderer the new-session bootstrap uses, so orientation survives compaction
+			// unchanged; it carries the OVERVIEW body and the topic index under bootstrapTokens.
+			const orientation = renderBootstrapBlock(
+				readOverview(runtime.projectDir),
+				listTopics(runtime.projectDir, ctx.cwd),
+				runtime.config.bootstrapTokens,
+			);
+			const summary = renderSummary(undefined, orientation, projection.observations);
 
 			return {
 				compaction: {

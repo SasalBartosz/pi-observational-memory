@@ -1,7 +1,7 @@
 {
   "name": "observational-memory",
   "version": "0.1.0",
-  "description": "Observational memory for pi — tiered, subprocess-backed memory: parallel observers feed a branch-local ledger buffer; a consolidator (Phase B) promotes the oldest observations into durable .memory/ topic files.",
+  "description": "Observational memory for pi — project-scoped, subprocess-backed memory: parallel observers distill the conversation into a session ledger; a consolidator promotes established observations into the shared .memory/project/ bank (INDEX.md, OVERVIEW.md, topic files) reused by every session in the cwd, with per-session archives under .memory/sessions/ and transient worker IPC under .memory/runtime/.",
   "type": "module",
   "license": "MIT",
   "pi": {

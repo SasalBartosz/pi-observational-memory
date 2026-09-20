@@ -1,12 +1,15 @@
 /**
- * `.memory/` substrate (Phase B). The filesystem IS the long-term recall interface: the master
- * reads topic files with ordinary `ls`/`read`/`grep`. Topic files are NOT rolled back by `/tree`
- * (they track the repo, not the session branch).
+ * `.memory/` substrate — the three-root, cwd-scoped storage layout:
  *
- * Layout under <project>/.memory/:
- *   INDEX.md            — orchestrator-owned; (re)rendered from topic front-matter
- *   <topic>.md          — consolidator-authored; YAML front-matter + current-state prose
- *   .runs/<id>.json     — transient worker IPC (not GC'd in v1)
+ *   <cwd>/.memory/
+ *   ├── project/                        shared durable bank (INDEX.md, OVERVIEW.md, topics)
+ *   ├── sessions/<sessionId>/archive/   session-only pre-drain archives (persistent)
+ *   └── runtime/<sessionId>/runs/       transient worker IPC (result/cost files)
+ *
+ * The filesystem IS the long-term recall interface: the master reads topic files with ordinary
+ * `ls`/`read`/`grep`. Topic files are NOT rolled back by `/tree` (they track the repo, not the
+ * session branch). Nothing in the bank is dated — no timestamps, session attribution, or
+ * change logs; Git and session logs own history.
  *
  * All writes are atomic (temp + rename) so a reader never sees a half-written file.
  */
@@ -15,38 +18,84 @@ import { dirname, join, relative, resolve } from "node:path";
 
 export const INDEX_FILENAME = "INDEX.md";
 /**
- * The running, whole-project descriptive history. Consolidator-authored prose (no front-matter),
- * pushed into every compaction block for orientation. Like INDEX.md it is a special file, NOT a
- * topic file: it is excluded from `listTopics`/the memory map and read verbatim at compaction.
+ * The undated, current-state project orientation. Consolidator-authored prose (no front-matter),
+ * rewritten wholesale to reflect established understanding and carried by every orientation
+ * block (compaction + bootstrap). Like INDEX.md a special file, NOT a topic file: it is excluded
+ * from `listTopics` and read verbatim.
  */
-export const JOURNEY_FILENAME = "JOURNEY.md";
+export const OVERVIEW_FILENAME = "OVERVIEW.md";
 
-/** The project-level `.memory/` base. Per-session roots live one level below it. */
+/** The cwd-level `.memory/` base; the three roots (project / sessions / runtime) live below it. */
 export function memoryBaseDir(cwd: string): string {
 	return join(cwd, ".memory");
 }
 
 /**
- * The per-session memory root: `.memory/<sessionId>/`. All durable long-term memory (INDEX,
- * topic files, JOURNEY) and transient `.runs/` IPC are scoped under here so two sessions in the
- * same project never share consolidator output. Keyed by the immutable session header id
- * (survives /name, /resume, /tree) — NOT the session filename or display name.
+ * The shared durable bank `<cwd>/.memory/project` — INDEX.md, OVERVIEW.md, and topic files read
+ * by every session in this cwd; also the consolidator's sandbox. Derived directly from the
+ * given cwd: no Git-root search, no project-identity layer.
  */
-export function sessionMemoryRoot(cwd: string, sessionId: string): string {
-	return join(memoryBaseDir(cwd), sessionId);
+export function projectMemoryDir(cwd: string): string {
+	return join(memoryBaseDir(cwd), "project");
+}
+
+/**
+ * The session-local pre-drain archive dir `<cwd>/.memory/sessions/<sessionId>/archive` — where
+ * consolidator batches are written verbatim before draining. Persistent, unlike the runtime dir.
+ */
+export function sessionArchiveDir(cwd: string, sessionId: string): string {
+	return join(memoryBaseDir(cwd), "sessions", sessionId, "archive");
+}
+
+/**
+ * The transient runtime dir `<cwd>/.memory/runtime/<sessionId>` — the worker spawn cwd and the
+ * `runs/` IPC files beneath it. Safe to clean periodically, but never while workers are live;
+ * session archives are not part of that cleanup.
+ */
+export function sessionRuntimeDir(cwd: string, sessionId: string): string {
+	return join(memoryBaseDir(cwd), "runtime", sessionId);
+}
+
+/** A session context with just enough surface to resolve the three storage roots. */
+export type ResolvePathsCtx = {
+	cwd: string;
+	sessionManager: { getSessionId: () => string };
+};
+
+/**
+ * Compute the three storage roots (project bank / session archive / runtime dir) from
+ * `ctx.cwd` + the session id — the single derivation every activation goes through. Pure:
+ * creates nothing; each root is created lazily by its first writer.
+ */
+export function resolvePaths(ctx: ResolvePathsCtx): {
+	sessionId: string;
+	projectDir: string;
+	archiveDir: string;
+	runtimeDir: string;
+} {
+	const sessionId = ctx.sessionManager.getSessionId();
+	return {
+		sessionId,
+		projectDir: projectMemoryDir(ctx.cwd),
+		archiveDir: sessionArchiveDir(ctx.cwd, sessionId),
+		runtimeDir: sessionRuntimeDir(ctx.cwd, sessionId),
+	};
 }
 
 export function indexPath(root: string): string {
 	return join(root, INDEX_FILENAME);
 }
 
-export function journeyPath(root: string): string {
-	return join(root, JOURNEY_FILENAME);
+export function overviewPath(root: string): string {
+	return join(root, OVERVIEW_FILENAME);
 }
 
-/** Read `.memory/JOURNEY.md` body, trimmed. Returns undefined when missing or effectively empty. */
-export function readJourney(root: string): string | undefined {
-	const path = journeyPath(root);
+/**
+ * Read the OVERVIEW.md body (undated current-state orientation), trimmed. Returns undefined
+ * when missing or effectively empty.
+ */
+export function readOverview(root: string): string | undefined {
+	const path = overviewPath(root);
 	if (!existsSync(path)) return undefined;
 	try {
 		const body = readFileSync(path, "utf-8").trim();
@@ -65,15 +114,15 @@ export function atomicWrite(path: string, content: string): void {
 }
 
 /**
- * Resolve a (possibly relative) path and confirm it stays inside `.memory/`. Returns the
- * absolute path, or undefined if it escapes the sandbox. The consolidator's scoped tools use
- * this to reject any path outside `.memory/` (design risk 6).
+ * Resolve a (possibly relative) path and confirm it stays inside the given root (the project
+ * bank). Returns the absolute path, or undefined if it escapes the sandbox. The consolidator's
+ * scoped tools reject any path outside the bank this way (design risk 6).
  */
 export function resolveWithinMemory(root: string, requestedPath: string): string | undefined {
 	const base = resolve(root);
 	const abs = resolve(base, requestedPath);
 	const rel = relative(base, abs);
-	if (rel === "" || rel === ".") return abs; // the session memory root itself
+	if (rel === "" || rel === ".") return abs; // the bank root itself
 	if (rel.startsWith("..") || resolve(base, rel) !== abs) return undefined;
 	return abs;
 }
@@ -82,11 +131,10 @@ export type TopicFrontMatter = {
 	id?: string;
 	title?: string;
 	summary?: string;
-	updated?: string;
 };
 
 export type Topic = TopicFrontMatter & {
-	/** Path relative to the project root, e.g. ".memory/auth.md". */
+	/** Path relative to the project cwd, e.g. ".memory/project/auth.md". */
 	path: string;
 	/** Bare filename, e.g. "auth.md". */
 	filename: string;
@@ -95,9 +143,10 @@ export type Topic = TopicFrontMatter & {
 const FRONT_MATTER_RE = /^---\n([\s\S]*?)\n---\n?/;
 
 /**
- * Parse leading YAML-ish front-matter. Intentionally tiny (no YAML dep): supports the flat
- * `key: value` fields the consolidator authors (id, title, summary, updated). Returns the
- * parsed fields plus the body after the front-matter block.
+ * Parse leading YAML-ish front-matter. Intentionally tiny (no YAML dep): supports exactly the
+ * flat routing fields the consolidator authors — `id`, `title`, `summary` (nothing else; the
+ * schema carries no dates or timestamps). Returns the parsed fields plus the body after the
+ * front-matter block.
  */
 export function parseFrontMatter(content: string): { front: TopicFrontMatter; body: string } {
 	const match = FRONT_MATTER_RE.exec(content);
@@ -114,7 +163,7 @@ export function parseFrontMatter(content: string): { front: TopicFrontMatter; bo
 		) {
 			value = value.slice(1, -1);
 		}
-		if (key === "id" || key === "title" || key === "summary" || key === "updated") {
+		if (key === "id" || key === "title" || key === "summary") {
 			front[key] = value;
 		}
 	}
@@ -122,24 +171,24 @@ export function parseFrontMatter(content: string): { front: TopicFrontMatter; bo
 }
 
 /**
- * List parsed topic files (every `*.md` except INDEX.md/JOURNEY.md) under a session memory
- * root, sorted by filename. Each topic's `path` is rendered relative to the project cwd (e.g.
- * `.memory/<sessionId>/auth.md`) so the master can `read`/`grep` it directly from the map.
+ * List parsed topic files (every `*.md` except INDEX.md/OVERVIEW.md) under the project bank,
+ * sorted by filename. The project cwd is passed in explicitly (not derived from the bank path)
+ * so each topic's `path` renders relative to it — e.g. `.memory/project/auth.md` — and the
+ * master can `read`/`grep` it directly from the map.
  */
-export function listTopics(root: string): Topic[] {
-	if (!existsSync(root)) return [];
-	const cwd = resolve(root, "..", "..");
+export function listTopics(projectDir: string, cwd: string): Topic[] {
+	if (!existsSync(projectDir)) return [];
 	const topics: Topic[] = [];
-	for (const filename of readdirSync(root)) {
-		if (!filename.endsWith(".md") || filename === INDEX_FILENAME || filename === JOURNEY_FILENAME) continue;
+	for (const filename of readdirSync(projectDir)) {
+		if (!filename.endsWith(".md") || filename === INDEX_FILENAME || filename === OVERVIEW_FILENAME) continue;
 		let content: string;
 		try {
-			content = readFileSync(join(root, filename), "utf-8");
+			content = readFileSync(join(projectDir, filename), "utf-8");
 		} catch {
 			continue;
 		}
 		const { front } = parseFrontMatter(content);
-		topics.push({ ...front, path: relative(cwd, join(root, filename)), filename });
+		topics.push({ ...front, path: relative(cwd, join(projectDir, filename)), filename });
 	}
 	topics.sort((a, b) => (a.filename < b.filename ? -1 : a.filename > b.filename ? 1 : 0));
 	return topics;

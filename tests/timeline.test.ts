@@ -31,7 +31,7 @@ describe("renderTimeline", () => {
 			observationsRecordedEntry("r1", { observations: [observation("t1")], coversUpToId: "m1" }) as unknown as Entry,
 			bigMessage("m2", 3000),
 			observationsRecordedEntry("r2", { observations: [observation("t2")], coversUpToId: "m2" }) as unknown as Entry,
-			// t1 promoted to .memory, t2 still in pool
+			// t1 promoted to .memory/project/, t2 still in pool
 			observationsDroppedEntry("d1", { observationTimestamps: ["t1"], coversUpToId: "m2" }) as unknown as Entry,
 			bigMessage("m3", 6000), // ~2 raw (unobserved) cells
 		] as Entry[];
@@ -39,7 +39,7 @@ describe("renderTimeline", () => {
 		const out = renderTimeline(branch, cfg);
 		const strip = out.split("\n")[1];
 		expect(strip).toBe("▓▒░░▶"); // consolidated, pool, 2 raw, tip
-		expect(out).toContain("▓ .memory (1)");
+		expect(out).toContain("▓ .memory/project/ (1)");
 		expect(out).toContain("▒ pool (1)");
 	});
 

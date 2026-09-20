@@ -33,6 +33,11 @@ When the user TELLS you something about themselves, their project, or their envi
   BAD:  User discussed auth middleware.
   GOOD: User asked how to configure JWT auth middleware.
 
+Treat sub-agent results as evidence, not established facts.
+Custom messages that report the outcome of a task or sub agent (e.g. subagent_result) carry that agent's findings. Record what the agent reported, attributed to it — do not convert its claim into a user assertion or a confirmed fact.
+  GOOD: Sub-agent reported the flaky test passes after the retry fix.
+  BAD: The flaky test passes after the retry fix. (presented as established, without the user confirming it)
+
 Preserve unusual phrasing.
 When the user uses non-standard terminology, quote their exact words so future runs can recognize the term.
   GOOD: User stated they did a "movement session" (their term) yesterday.
@@ -68,11 +73,3 @@ Detail preservation. Preserve distinguishing details so future queries can still
 Timestamp format: "YYYY-MM-DD HH:MM" (local time, 24-hour, to the minute). This goes in the timestamp field, not the content.
 
 Remember: these observations are the assistant's ONLY memory of this chunk once the raw messages fall out of context. Make them count.`;
-
-/**
- * Kickoff message passed as the `pi -p` positional arg. It only *triggers* the run; the
- * chunk itself is injected as a user message by the agent's `context` hook (see agent/index.ts),
- * never via the system prompt or shell args.
- */
-export const OBSERVER_KICKOFF =
-	"A conversation chunk has been placed in your context. Compress it into observations by calling record_observations one or more times, then reply with a one-sentence confirmation when the chunk is fully covered.";

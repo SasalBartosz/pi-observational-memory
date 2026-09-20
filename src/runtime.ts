@@ -1,5 +1,6 @@
 import { type Config, DEFAULTS, loadConfig } from "./config.js";
 import { foldLedger, poolTokens, rawTokensSinceObservationCoverage, sumSessionCost, type Entry } from "./ledger/index.js";
+import { resolvePaths } from "./memory/paths.js";
 import { StatusController } from "./ui/status-controller.js";
 
 /**
@@ -14,11 +15,24 @@ export class Runtime {
 	enabled = false;
 
 	/**
-	 * Absolute `.memory/<sessionId>/` root for this session's durable + transient memory. Set
-	 * whenever the gate is enabled (session_start / `/om on`) via `ensureSessionMemory`; empty
-	 * while disabled. All path helpers (listTopics/indexPath/readJourney/run*Path) take this root.
+	 * Immutable session-header id captured at activation (survives /name, /resume, /tree);
+	 * empty before the first session_start. The three storage roots below derive from it.
 	 */
-	memoryRoot = "";
+	sessionId = "";
+
+	/**
+	 * The shared durable bank `<cwd>/.memory/project` — INDEX/OVERVIEW/topic reads and the
+	 * consolidator's sandbox. Captured at activation (session_start, `/om on`) from `ctx.cwd` +
+	 * the session id — never from a worker's cwd or a mid-session shell `cd`. Empty before the
+	 * first activation.
+	 */
+	projectDir = "";
+
+	/** Session-local pre-drain archives `<cwd>/.memory/sessions/<sessionId>/archive`. Captured at activation like projectDir. */
+	archiveDir = "";
+
+	/** Transient worker IPC root `<cwd>/.memory/runtime/<sessionId>` — also every worker's spawn cwd. Captured at activation like projectDir. */
+	runtimeDir = "";
 
 	/**
 	 * In-flight observer subprocesses, keyed by runId. `coversUpToId` is the source-entry id at
@@ -109,6 +123,20 @@ export class Runtime {
 		if (this.configLoaded) return;
 		this.config = loadConfig(cwd);
 		this.configLoaded = true;
+	}
+
+	/**
+	 * Resolve and capture the three storage roots (project bank / session archive / runtime
+	 * dir) from `ctx.cwd` + the session id. Called at activation (session_start, `/om on`); on
+	 * session replacement the caller aborts in-flight workers first, then re-resolves here so
+	 * an old run never commits into the new session's ledger. Pure — creates no directories.
+	 */
+	activatePaths(ctx: { cwd: string; sessionManager: { getSessionId: () => string } }): void {
+		const paths = resolvePaths(ctx);
+		this.sessionId = paths.sessionId;
+		this.projectDir = paths.projectDir;
+		this.archiveDir = paths.archiveDir;
+		this.runtimeDir = paths.runtimeDir;
 	}
 
 	/** Recompute the live footer gauges (next-observer + pool + context) from the current branch. */
