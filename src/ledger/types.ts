@@ -11,6 +11,12 @@
 export const OM_OBSERVATIONS_RECORDED = "om.observations.recorded";
 /** Promotion tombstones written by the orchestrator after a consolidator run (Phase B). */
 export const OM_OBSERVATIONS_DROPPED = "om.observations.dropped";
+/**
+ * Pre-drain archive map (plan §7d/§7e): appended by the orchestrator right before a batch is
+ * submitted to the consolidator, so the session archive stays retrievable from ledger
+ * context even after the batch (and the entries around it) is compacted away.
+ */
+export const OM_OBSERVATIONS_ARCHIVED = "om.observations.archived";
 /** Compaction details type stamped into the compaction entry's `details`. */
 export const OM_FOLDED = "om.folded";
 /** Per-session on/off gate state (default OFF). See src/index.ts. */
@@ -66,6 +72,19 @@ export type ObservationsDroppedEntryData = {
 	coversUpToId: string;
 };
 
+/** One archived batch pointer; `path` is relative to the session cwd for readability. */
+export type ObservationsArchivedEntryData = {
+	/** Deterministic batch id (hash of the source session id + sorted timestamps) — also the archive file name. */
+	batchId: string;
+	/** Archive file path, relative to the session cwd. */
+	path: string;
+	/** Timestamps of the archived (submitted) observations. */
+	timestamps: string[];
+};
+
+/** Alias used by fold/projection consumers: an archive pointer as collected off the ledger. */
+export type ArchivedBatch = ObservationsArchivedEntryData;
+
 export type CostEntryData = {
 	costUsd: number;
 	role: "observer" | "consolidator";
@@ -79,7 +98,10 @@ export type MemoryDetails = {
 	observations: Observation[];
 };
 
-export type MemoryCustomType = typeof OM_OBSERVATIONS_RECORDED | typeof OM_OBSERVATIONS_DROPPED;
+export type MemoryCustomType =
+	| typeof OM_OBSERVATIONS_RECORDED
+	| typeof OM_OBSERVATIONS_DROPPED
+	| typeof OM_OBSERVATIONS_ARCHIVED;
 
 export function isNonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0;
@@ -120,6 +142,13 @@ export function isObservationsRecordedData(value: unknown): value is Observation
 export function isObservationsDroppedData(value: unknown): value is ObservationsDroppedEntryData {
 	if (!isPlainRecord(value)) return false;
 	return isNonEmptyStringArray(value.observationTimestamps) && isNonEmptyString(value.coversUpToId);
+}
+
+export function isObservationsArchivedData(value: unknown): value is ObservationsArchivedEntryData {
+	if (!isPlainRecord(value)) return false;
+	return (
+		isNonEmptyString(value.batchId) && isNonEmptyString(value.path) && isNonEmptyStringArray(value.timestamps)
+	);
 }
 
 export function isMemoryDetails(value: unknown): value is MemoryDetails {
@@ -175,6 +204,14 @@ export function isObservationsDroppedEntry(entry: Entry): entry is Entry & {
 	return entry.type === "custom" && entry.customType === OM_OBSERVATIONS_DROPPED && isObservationsDroppedData(entry.data);
 }
 
+export function isObservationsArchivedEntry(entry: Entry): entry is Entry & {
+	type: "custom";
+	customType: typeof OM_OBSERVATIONS_ARCHIVED;
+	data: ObservationsArchivedEntryData;
+} {
+	return entry.type === "custom" && entry.customType === OM_OBSERVATIONS_ARCHIVED && isObservationsArchivedData(entry.data);
+}
+
 export function buildObservationsRecordedData(
 	observations: Observation[],
 	coversUpToId: string,
@@ -189,4 +226,13 @@ export function buildObservationsDroppedData(
 ): ObservationsDroppedEntryData | undefined {
 	if (observationTimestamps.length === 0 || !isNonEmptyString(coversUpToId)) return undefined;
 	return { observationTimestamps, coversUpToId };
+}
+
+export function buildObservationsArchivedData(
+	batchId: string,
+	path: string,
+	timestamps: string[],
+): ObservationsArchivedEntryData | undefined {
+	if (timestamps.length === 0 || !isNonEmptyString(batchId) || !isNonEmptyString(path)) return undefined;
+	return { batchId, path, timestamps };
 }

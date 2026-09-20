@@ -111,6 +111,8 @@ export type WorkerLaunchEnv = {
 	runId: string;
 	/** Consolidator role only: the shared project bank — the sandbox root for its scoped file tools. */
 	projectDir?: string;
+	/** Consolidator role only: the deterministic batch id — pins the outcome contract to this batch. */
+	batchId?: string;
 };
 
 /**
@@ -138,8 +140,14 @@ export function buildWorkerEnv(role: "observer" | "consolidator", opts: WorkerLa
 		if (!opts.projectDir) {
 			throw new Error("consolidator worker requires projectDir (the shared-bank sandbox)");
 		}
+		if (!opts.batchId) {
+			throw new Error("consolidator worker requires batchId (the validated-outcome contract)");
+		}
 		// Sandbox root for the consolidator's scoped file tools (design risk 6).
 		env.OM_MEMORY_DIR = opts.projectDir;
+		// The batch id the worker must echo back in report_consolidation_outcomes; the
+		// orchestrator rejects a result file whose batchId does not match the submitted batch.
+		env.OM_BATCH_ID = opts.batchId;
 	}
 	return env;
 }

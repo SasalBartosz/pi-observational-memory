@@ -59,16 +59,30 @@ describe("launch argv + env", () => {
 	it("gives the consolidator the shared bank as OM_MEMORY_DIR, IPC under the runtime dir", () => {
 		const runtimeDir = "/proj/.memory/runtime/sess-1";
 		const projectDir = "/proj/.memory/project";
-		const env = buildWorkerEnv("consolidator", { runtimeDir, projectDir, runId: "c1" });
+		const env = buildWorkerEnv("consolidator", { runtimeDir, projectDir, runId: "c1", batchId: "batch-abc" });
 		expect(env.OM_WORKER).toBe("consolidator");
 		expect(env.OM_MEMORY_DIR).toBe(projectDir);
+		// The batch id pins the outcome contract to the submitted batch.
+		expect(env.OM_BATCH_ID).toBe("batch-abc");
 		// The consolidator's result file is the outcome contract, still under the runtime dir.
 		expect(env.OM_RESULT_PATH).toBe(consolidatorResultPath(runtimeDir, "c1"));
 		expect(env.OM_COST_PATH).toBe(runCostPath(runtimeDir, "c1"));
 	});
 
 	it("refuses a consolidator without the shared-bank sandbox root", () => {
-		expect(() => buildWorkerEnv("consolidator", { runtimeDir: "/proj/.memory/runtime/sess-1", runId: "c1" })).toThrow();
+		expect(() =>
+			buildWorkerEnv("consolidator", { runtimeDir: "/proj/.memory/runtime/sess-1", runId: "c1", batchId: "batch-abc" }),
+		).toThrow();
+	});
+
+	it("refuses a consolidator without a batch id", () => {
+		expect(() =>
+			buildWorkerEnv("consolidator", {
+				runtimeDir: "/proj/.memory/runtime/sess-1",
+				projectDir: "/proj/.memory/project",
+				runId: "c1",
+			}),
+		).toThrow(/batchId/);
 	});
 
 	it("resolves run paths under the session runtime dir's runs/ (outside the durable bank)", () => {

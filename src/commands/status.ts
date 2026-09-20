@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { foldLedger, poolTokens, rawTokensSinceObservationCoverage, sumSessionCost, type Entry } from "../ledger/index.js";
+import { inspectProjectLock } from "../memory/lock.js";
 import { listTopics, readOverview } from "../memory/paths.js";
 import { estimateStringTokens } from "../tokens.js";
 import type { Runtime } from "../runtime.js";
@@ -23,6 +24,10 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 			const topicCount = listTopics(runtime.projectDir, ctx.cwd).length;
 			const overview = readOverview(runtime.projectDir);
 			const { costUsd, runs } = sumSessionCost(ctx.sessionManager.getEntries() as Entry[]);
+			// Cross-process consolidation lock state (plan §4): idle, or the holder's human-
+			// readable status; a stale lock (dead pid) is flagged for manual cleanup.
+			const lock = inspectProjectLock(runtime.projectDir);
+			const lockState = lock === undefined ? "idle" : lock.stale ? `stale — ${lock.message}` : lock.message;
 
 			const lines = [
 				`om status`,
@@ -35,14 +40,13 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 				`  topic files: ${topicCount}`,
 				`  overview: ${overview ? `~${estimateStringTokens(overview).toLocaleString()} / ${runtime.config.overviewTargetTokens.toLocaleString()} tok` : "none yet"}`,
 				`  project memory: ${runtime.projectDir}`,
+				`  consolidation lock: ${lockState}`,
 				`  context: ${contextTokens != null ? contextTokens.toLocaleString() : "?"} / ${runtime.config.compactAtContextTokens.toLocaleString()} tok`,
 				`  session cost: $${costUsd.toFixed(4)} (${runs} run${runs === 1 ? "" : "s"})`,
 				runtime.lastWorkerError ? `  last error: ${runtime.lastWorkerError}` : `  last error: none`,
 				"",
 				renderTimeline(branch, runtime.config),
 			];
-			// TODO(§4/§7): extend the `project memory:` line with the cross-process consolidation
-			// lock state (held/idle) once the lock module lands.
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});

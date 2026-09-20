@@ -21,6 +21,7 @@ export type TestObservation = {
 
 export const OM_OBSERVATIONS_RECORDED = "om.observations.recorded";
 export const OM_OBSERVATIONS_DROPPED = "om.observations.dropped";
+export const OM_OBSERVATIONS_ARCHIVED = "om.observations.archived";
 export const OM_FOLDED = "om.folded";
 export const OM_COST = "om.cost";
 
@@ -160,6 +161,22 @@ export function observationsDroppedEntry(
 		parentId: null,
 		timestamp: DEFAULT_TIMESTAMP,
 		customType: OM_OBSERVATIONS_DROPPED,
+		data: args,
+		...overrides,
+	};
+}
+
+export function observationsArchivedEntry(
+	id: string,
+	args: { batchId: string; path: string; timestamps: string[] },
+	overrides: Partial<TestEntry> = {},
+): TestEntry {
+	return {
+		type: "custom",
+		id,
+		parentId: null,
+		timestamp: DEFAULT_TIMESTAMP,
+		customType: OM_OBSERVATIONS_ARCHIVED,
 		data: args,
 		...overrides,
 	};

@@ -84,6 +84,29 @@ describe("renderSummary (project overview + map + observations)", () => {
 			"2026-05-02T10:00:00.02",
 		]);
 	});
+
+	it("renders a compact session archive section: one line per batch, paths only", () => {
+		const block = renderSummary(undefined, undefined, [observation("2026-05-02T10:00:01")], [
+			{
+				batchId: "b1",
+				path: join(".memory", "sessions", "s1", "archive", "b1.json"),
+				timestamps: ["2026-05-02T10:00:01", "2026-05-02T10:00:02"],
+			},
+			{ batchId: "b2", path: join(".memory", "sessions", "s1", "archive", "b2.json"), timestamps: ["2026-05-02T10:05:00"] },
+		]);
+		expect(block).toContain("## Session archive");
+		expect(block).toContain(`- ${join(".memory", "sessions", "s1", "archive", "b1.json")} (2 observations)`);
+		expect(block).toContain(`- ${join(".memory", "sessions", "s1", "archive", "b2.json")} (1 observations)`);
+		expect(block.indexOf("## Observations")).toBeLessThan(block.indexOf("## Session archive"));
+	});
+
+	it("renders archive-only blocks and omits the section when there are no batches", () => {
+		expect(renderSummary(undefined, undefined, [], [{ batchId: "b1", path: "p.json", timestamps: ["t1"] }])).toContain(
+			"## Session archive",
+		);
+		const withoutBatches = renderSummary(undefined, undefined, [observation("2026-05-02T10:00:01")]);
+		expect(withoutBatches).not.toContain("## Session archive");
+	});
 });
 
 describe("renderIndexFile", () => {

@@ -1,8 +1,11 @@
 import {
+	isObservationsArchivedData,
 	isObservationsDroppedData,
 	isObservationsRecordedData,
+	OM_OBSERVATIONS_ARCHIVED,
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
+	type ArchivedBatch,
 	type Entry,
 	type Observation,
 } from "./types.js";
@@ -21,6 +24,12 @@ export type FoldedLedger = {
 	droppedObservationTimestamps: Set<string>;
 	/** First-valid observation records by timestamp (id), including dropped ones. */
 	observationsByTimestamp: Map<string, Observation>;
+	/**
+	 * Archive pointers (om.observations.archived) in first-valid order, deduped by batchId —
+	 * a replayed batch derives the same batchId and merges instead of duplicating. Purely
+	 * collected metadata: archived entries never affect activeObservations.
+	 */
+	archivedBatches: ArchivedBatch[];
 };
 
 function foldEndIndex(entries: Entry[], upToEntryId: string | undefined): number {
@@ -44,6 +53,8 @@ function isCustomEntry(entry: Entry, customType: string): boolean {
 export function foldLedger(entries: Entry[], options: FoldLedgerOptions = {}): FoldedLedger {
 	const observationsByTimestamp = new Map<string, Observation>();
 	const droppedObservationTimestamps = new Set<string>();
+	const archivedBatches: ArchivedBatch[] = [];
+	const seenBatchIds = new Set<string>();
 	const endIdx = foldEndIndex(entries, options.upToEntryId);
 
 	for (let i = 0; i <= endIdx; i++) {
@@ -65,6 +76,15 @@ export function foldLedger(entries: Entry[], options: FoldLedgerOptions = {}): F
 			for (const timestamp of entry.data.observationTimestamps) {
 				droppedObservationTimestamps.add(timestamp);
 			}
+			continue;
+		}
+
+		if (isCustomEntry(entry, OM_OBSERVATIONS_ARCHIVED)) {
+			if (!isObservationsArchivedData(entry.data)) continue;
+			if (!seenBatchIds.has(entry.data.batchId)) {
+				seenBatchIds.add(entry.data.batchId);
+				archivedBatches.push(entry.data);
+			}
 		}
 	}
 
@@ -78,5 +98,6 @@ export function foldLedger(entries: Entry[], options: FoldLedgerOptions = {}): F
 		activeObservations,
 		droppedObservationTimestamps,
 		observationsByTimestamp,
+		archivedBatches,
 	};
 }

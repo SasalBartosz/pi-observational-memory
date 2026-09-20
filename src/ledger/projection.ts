@@ -1,8 +1,10 @@
 import {
 	OM_FOLDED,
 	isMemoryDetails,
+	isObservationsArchivedEntry,
 	isObservationsDroppedEntry,
 	isObservationsRecordedEntry,
+	type ArchivedBatch,
 	type Entry,
 	type MemoryDetails,
 	type Observation,
@@ -14,6 +16,12 @@ export type Projection = {
 
 export type CompactionProjection = Projection & {
 	details: MemoryDetails;
+	/**
+	 * Archive pointers (om.observations.archived) folded from the compacted prefix — the part
+	 * of the branch the compaction summary replaces. Entries inside the verbatim tail are kept
+	 * verbatim and excluded here; batches are deduped by id (a replayed batch merges).
+	 */
+	archivedBatches: ArchivedBatch[];
 };
 
 type ProjectionBoundary =
@@ -115,5 +123,26 @@ export function buildCompactionProjection(entries: Entry[], firstKeptEntryId: st
 		version: 1,
 		observations: projection.observations,
 	};
-	return { observations: projection.observations, details };
+	return { observations: projection.observations, details, archivedBatches: archivedBatchesBefore(entries, firstKeptEntryId) };
+}
+
+/**
+ * Archive pointers lying in the compacted prefix (strictly before the first kept entry),
+ * deduped by batchId in first-appearance order. Archived entries have no coversUpToId, so
+ * branch position is the boundary test — the entry was appended at dispatch time and only
+ * pre-cutoff ones fall out of the verbatim tail.
+ */
+function archivedBatchesBefore(entries: Entry[], firstKeptEntryId: string): ArchivedBatch[] {
+	const indexes = entryIndexById(entries);
+	const cutoffIdx = indexes.get(firstKeptEntryId) ?? -1;
+	const archivedBatches: ArchivedBatch[] = [];
+	const seenBatchIds = new Set<string>();
+	for (const entry of entries) {
+		if (!isObservationsArchivedEntry(entry)) continue;
+		if ((indexes.get(entry.id) ?? -1) >= cutoffIdx) continue;
+		if (seenBatchIds.has(entry.data.batchId)) continue;
+		seenBatchIds.add(entry.data.batchId);
+		archivedBatches.push(entry.data);
+	}
+	return archivedBatches;
 }

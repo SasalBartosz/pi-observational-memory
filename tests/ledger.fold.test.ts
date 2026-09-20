@@ -4,6 +4,7 @@ import { foldLedger } from "../src/ledger/index.js";
 import {
 	branchSummary,
 	observation,
+	observationsArchivedEntry,
 	observationsDroppedEntry,
 	observationsRecordedEntry,
 	textCustomMessage,
@@ -70,6 +71,49 @@ describe("foldLedger (minimal schema, timestamp-keyed)", () => {
 
 		expect(folded.droppedObservationTimestamps.has("2099-01-01T00:00:00")).toBe(true);
 		expect(folded.activeObservations).toEqual([]);
+	});
+
+	it("collects archived batch pointers without affecting active observations, deduped by batchId", () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsRecordedEntry("om-1", {
+				observations: [observation("2026-05-02T10:00:01")],
+				coversUpToId: "raw-1",
+			}),
+			observationsArchivedEntry("om-arch-1", {
+				batchId: "b1",
+				path: ".memory/sessions/s1/archive/b1.json",
+				timestamps: ["2026-05-02T10:00:01"],
+			}),
+			// Replay of the same batch (same deterministic batchId): merges, not duplicates.
+			observationsArchivedEntry("om-arch-2", {
+				batchId: "b1",
+				path: ".memory/sessions/s1/archive/b1.json",
+				timestamps: ["2026-05-02T10:00:01"],
+			}),
+			observationsArchivedEntry("om-arch-3", {
+				batchId: "b2",
+				path: ".memory/sessions/s1/archive/b2.json",
+				timestamps: ["2026-05-02T10:00:01"],
+			}),
+		];
+
+		const folded = foldLedger(entries);
+
+		expect(folded.archivedBatches.map((b) => b.batchId)).toEqual(["b1", "b2"]);
+		// Archived entries are pure metadata: the observation stays active.
+		expect(folded.activeObservations.map((o) => o.timestamp)).toEqual(["2026-05-02T10:00:01"]);
+	});
+
+	it("ignores invalid archived data", () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			unknownCustomEntry("om-arch-invalid", "om.observations.archived", { batchId: "x", path: "" }),
+		];
+
+		const folded = foldLedger(entries);
+
+		expect(folded.archivedBatches).toEqual([]);
 	});
 
 	it("ignores unknown custom entries and invalid data", () => {

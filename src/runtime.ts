@@ -1,5 +1,6 @@
 import { type Config, DEFAULTS, loadConfig } from "./config.js";
 import { foldLedger, poolTokens, rawTokensSinceObservationCoverage, sumSessionCost, type Entry } from "./ledger/index.js";
+import { releaseProjectLock, type LockHandle } from "./memory/lock.js";
 import { resolvePaths } from "./memory/paths.js";
 import { StatusController } from "./ui/status-controller.js";
 
@@ -52,6 +53,14 @@ export class Runtime {
 	 */
 	consolidatorInFlight = false;
 	consolidatorController: AbortController | undefined;
+	/**
+	 * The cross-process project lock held by the in-flight consolidator, if any (plan §4). Kept
+	 * here so `/om off` and session replacement can abort the worker and then release the lock
+	 * in that order (never release while the worker may still write). `releaseConsolidatorLock()`
+	 * is idempotent: it clears the field first, so a later release from the dispatch's own
+	 * `finally` (or vice versa) is a safe no-op.
+	 */
+	consolidatorLock: LockHandle | undefined;
 
 	/**
 	 * coversUpToId of the most-recent chunk DISPATCHED (committed or still in flight). Combined
@@ -170,9 +179,25 @@ export class Runtime {
 			controller.abort();
 		}
 		this.observersInFlight.clear();
+		// Order matters (§4): abort the consolidator worker FIRST, then release the project lock
+		// only if we still hold it — never the other way around, and never while a worker we
+		// spawned is guaranteed live. The dispatch's own `finally` also releases; whichever runs
+		// first wins the field, the other is a no-op.
 		this.consolidatorController?.abort();
 		this.consolidatorController = undefined;
+		this.releaseConsolidatorLock();
 		this.consolidatorInFlight = false;
+	}
+
+	/**
+	 * Release the held consolidator project lock, if any. Idempotent and safe anywhere: the
+	 * field is cleared before the owner-checked release (which never throws).
+	 */
+	releaseConsolidatorLock(): void {
+		const handle = this.consolidatorLock;
+		if (!handle) return;
+		this.consolidatorLock = undefined;
+		releaseProjectLock(handle);
 	}
 
 	/** Track an observer task for the lifetime of its async run. */

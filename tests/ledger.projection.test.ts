@@ -5,6 +5,7 @@ import {
 	compactionEntry,
 	memoryDetails,
 	observation,
+	observationsArchivedEntry,
 	observationsDroppedEntry,
 	observationsRecordedEntry,
 	textCustomMessage,
@@ -59,6 +60,27 @@ describe("buildCompactionProjection", () => {
 
 		const projection = buildCompactionProjection(entries, "raw-2");
 		expect(projection.observations.map((o) => o.timestamp)).toEqual(["2026-05-02T10:00:02"]);
+	});
+
+	it("collects archived batch pointers from the compacted prefix (deduped), excluding the verbatim tail", () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsRecordedEntry("om-1", {
+				observations: [observation("2026-05-02T10:00:01")],
+				coversUpToId: "raw-1",
+			}),
+			observationsArchivedEntry("om-arch-1", { batchId: "b1", path: "p1.json", timestamps: ["2026-05-02T10:00:01"] }),
+			// Same batchId replayed earlier in the prefix: dedupes.
+			observationsArchivedEntry("om-arch-2", { batchId: "b1", path: "p1.json", timestamps: ["2026-05-02T10:00:01"] }),
+			textCustomMessage("raw-2", "bbbb"), // first kept entry — compaction cutoff
+			// Archived after the cutoff: kept verbatim, excluded from the summary projection.
+			observationsArchivedEntry("om-arch-3", { batchId: "b2", path: "p2.json", timestamps: ["2026-05-02T10:05:00"] }),
+		];
+
+		const projection = buildCompactionProjection(entries, "raw-2");
+
+		expect(projection.archivedBatches.map((b) => b.batchId)).toEqual(["b1"]);
+		expect(projection.archivedBatches[0]!.path).toBe("p1.json");
 	});
 });
 
