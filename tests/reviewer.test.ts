@@ -65,9 +65,14 @@ afterEach(() => {
 });
 
 describe("manual reviewer orchestration", () => {
-	it("accepts a detailed review summary without an arbitrary length cap", () => {
+	it("accepts detailed report and topic summaries without arbitrary length caps", () => {
 		const h = makeHarness();
 		const summary = "Detailed maintenance outcome. ".repeat(1_000);
+		writeFileSync(
+			join(h.projectDir, "stale.md"),
+			topic("stale", "Stale", "A specific routing summary that exceeds the suggested length. ".repeat(4), "Current details."),
+			"utf-8",
+		);
 
 		expect(() =>
 			validateReviewerResult(
@@ -75,7 +80,7 @@ describe("manual reviewer orchestration", () => {
 					reviewId: "review-long-summary",
 					files: [
 						{ path: "OVERVIEW.md", disposition: "kept" },
-						{ path: "stale.md", disposition: "kept" },
+						{ path: "stale.md", disposition: "updated" },
 					],
 					createdFiles: [],
 					summary,

@@ -79,7 +79,6 @@ function validateTopicFile(filename: string, content: string): void {
 	if (!fields.get("title")) throw new Error(`${filename} front-matter title is empty`);
 	const summary = fields.get("summary") ?? "";
 	if (!summary) throw new Error(`${filename} front-matter summary is empty`);
-	if (summary.length > 140) throw new Error(`${filename} front-matter summary exceeds 140 characters`);
 }
 
 /** Validate the terminal contract against both the initial file set and final bank state. */
