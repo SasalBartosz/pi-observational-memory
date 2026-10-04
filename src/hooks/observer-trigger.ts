@@ -27,7 +27,7 @@ export function recordWorkerCost(
 	pi: ExtensionAPI,
 	runtime: Runtime,
 	ctx: { sessionManager: { getEntries: () => Entry[] } },
-	role: "observer" | "consolidator",
+	role: "observer" | "consolidator" | "reviewer",
 	runId: string,
 ): void {
 	const cost = readWorkerCost(runCostPath(runtime.runtimeDir, runId));

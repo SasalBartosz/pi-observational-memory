@@ -9,7 +9,7 @@
  *   - Toasts via notify (start/finish/error), gated on hasUI by the caller.
  */
 
-export type WorkerType = "observer" | "consolidator";
+export type WorkerType = "observer" | "consolidator" | "reviewer";
 
 /** Live token gauges shown in the footer, right of "○ om". */
 export interface FooterGauges {

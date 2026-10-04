@@ -24,8 +24,8 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 			const topicCount = listTopics(runtime.projectDir, ctx.cwd).length;
 			const overview = readOverview(runtime.projectDir);
 			const { costUsd, runs } = sumSessionCost(ctx.sessionManager.getEntries() as Entry[]);
-			// Cross-process consolidation lock state (plan §4): idle, or the holder's human-
-			// readable status; a stale lock (dead pid) is flagged for manual cleanup.
+			// Cross-process project-memory writer lock state: idle, or the holder's human-readable
+			// status; a stale lock (dead pid) is flagged for manual cleanup.
 			const lock = inspectProjectLock(runtime.projectDir);
 			const lockState = lock === undefined ? "idle" : lock.stale ? `stale — ${lock.message}` : lock.message;
 
@@ -36,11 +36,12 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 				`  next observer: ${sinceObservation.toLocaleString()} / ${runtime.config.chunkTokens.toLocaleString()} tok`,
 				`  pool: ${pool.toLocaleString()} tok (target ${runtime.config.poolTargetTokens.toLocaleString()}, consolidate at ${runtime.config.consolidateAtPoolTokens.toLocaleString()})`,
 				`  consolidator: ${runtime.consolidatorInFlight ? "running" : "idle"}`,
+				`  reviewer: ${runtime.reviewerInFlight ? "running" : "idle"}`,
 				`  last compaction wait: ${runtime.lastCompactionObserverWait ?? "n/a"}`,
 				`  topic files: ${topicCount}`,
 				`  overview: ${overview ? `~${estimateStringTokens(overview).toLocaleString()} / ${runtime.config.overviewTargetTokens.toLocaleString()} tok` : "none yet"}`,
 				`  project memory: ${runtime.projectDir}`,
-				`  consolidation lock: ${lockState}`,
+				`  project memory lock: ${lockState}`,
 				`  context: ${contextTokens != null ? contextTokens.toLocaleString() : "?"} / ${runtime.config.compactAtContextTokens.toLocaleString()} tok`,
 				`  session cost: $${costUsd.toFixed(4)} (${runs} run${runs === 1 ? "" : "s"})`,
 				runtime.lastWorkerError ? `  last error: ${runtime.lastWorkerError}` : `  last error: none`,

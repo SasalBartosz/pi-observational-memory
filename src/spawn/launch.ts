@@ -11,7 +11,7 @@ import { mkdirSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import type { ConfiguredModel } from "../config.js";
-import { consolidatorResultPath, runCostPath, runResultPath } from "./runs.js";
+import { consolidatorResultPath, reviewerResultPath, runCostPath, runResultPath } from "./runs.js";
 
 /** Repo root = two levels up from src/spawn/. The shared agent extension lives at agent/index.ts. */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -109,30 +109,34 @@ export type WorkerLaunchEnv = {
 	/** Absolute session runtime dir — the worker's result/cost IPC files land under its runs/. */
 	runtimeDir: string;
 	runId: string;
-	/** Consolidator role only: the shared project bank — the sandbox root for its scoped file tools. */
+	/** Consolidator/reviewer: the shared project-memory bank (the mutable sandbox root). */
 	projectDir?: string;
-	/** Consolidator role only: the deterministic batch id — pins the outcome contract to this batch. */
+	/** Reviewer only: the project cwd exposed through read-only inspection tools. */
+	sourceDir?: string;
+	/** Consolidator only: the deterministic batch id that pins its outcome contract. */
 	batchId?: string;
+	/** Reviewer only: id echoed in the terminal review report. */
+	reviewId?: string;
 };
 
 /**
- * Build the env a worker subprocess needs, split by role. Both roles get their result/cost
- * IPC paths under the session runtime dir (transient, outside the durable bank). Only the
- * consolidator gets OM_MEMORY_DIR, pointing at the shared project bank — its sandbox is the
- * bank and nothing else. The chunk itself is NOT passed via env/file — it is the `pi -p`
- * prompt (recorded user message) so the run stays faithfully inspectable on resume.
+ * Build the env a worker subprocess needs, split by role. Every role gets result/cost IPC
+ * paths under the transient session runtime dir. Consolidator and reviewer get OM_MEMORY_DIR
+ * for scoped bank mutation; only the reviewer also gets OM_PROJECT_DIR for read-only source
+ * inspection. Kickoff input travels as the recorded `pi -p` prompt, not via env/file.
  */
-export function buildWorkerEnv(role: "observer" | "consolidator", opts: WorkerLaunchEnv): NodeJS.ProcessEnv {
+export function buildWorkerEnv(role: "observer" | "consolidator" | "reviewer", opts: WorkerLaunchEnv): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = {
 		...process.env,
 		OM_WORKER: role,
 		OM_RUN_ID: opts.runId,
-		// Result IPC lives under the runtime dir; the consolidator's result file is the
-		// validated-outcome contract (its own filename, same runs dir).
+		// Each role has a separate validated result shape, all under the same transient runs dir.
 		OM_RESULT_PATH:
 			role === "consolidator"
 				? consolidatorResultPath(opts.runtimeDir, opts.runId)
-				: runResultPath(opts.runtimeDir, opts.runId),
+				: role === "reviewer"
+					? reviewerResultPath(opts.runtimeDir, opts.runId)
+					: runResultPath(opts.runtimeDir, opts.runId),
 		// Per-run cost handoff: the worker extension writes pi's built-in usage.cost.total here.
 		OM_COST_PATH: runCostPath(opts.runtimeDir, opts.runId),
 	};
@@ -148,6 +152,14 @@ export function buildWorkerEnv(role: "observer" | "consolidator", opts: WorkerLa
 		// The batch id the worker must echo back in report_consolidation_outcomes; the
 		// orchestrator rejects a result file whose batchId does not match the submitted batch.
 		env.OM_BATCH_ID = opts.batchId;
+	}
+	if (role === "reviewer") {
+		if (!opts.projectDir) throw new Error("reviewer worker requires projectDir (the shared-bank sandbox)");
+		if (!opts.sourceDir) throw new Error("reviewer worker requires sourceDir (the read-only project root)");
+		if (!opts.reviewId) throw new Error("reviewer worker requires reviewId (the validated completion contract)");
+		env.OM_MEMORY_DIR = opts.projectDir;
+		env.OM_PROJECT_DIR = opts.sourceDir;
+		env.OM_REVIEW_ID = opts.reviewId;
 	}
 	return env;
 }

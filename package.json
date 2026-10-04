@@ -1,7 +1,7 @@
 {
   "name": "observational-memory",
   "version": "0.1.0",
-  "description": "Observational memory for pi — project-scoped, subprocess-backed memory: parallel observers distill the conversation into a session ledger; a consolidator promotes established observations into the shared .memory/project/ bank (INDEX.md, OVERVIEW.md, topic files) reused by every session in the cwd, with per-session archives under .memory/sessions/ and transient worker IPC under .memory/runtime/.",
+  "description": "Observational memory for pi — observers distill conversations, a consolidator promotes established knowledge into a shared project bank, and a manual reviewer verifies, merges, and prunes that durable memory.",
   "type": "module",
   "license": "MIT",
   "pi": {

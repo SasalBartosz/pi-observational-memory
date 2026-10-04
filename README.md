@@ -6,9 +6,10 @@ Parallel **observers** distill raw conversation chunks into atomic observations 
 session-local pool; a deterministic, model-free **compaction** renders that pool into the
 compaction block; a **consolidator** promotes established observations into the **shared
 durable bank** at `.memory/project/` (INDEX.md, OVERVIEW.md, topic files) — one bank per
-working directory, reused by every session that starts there. Anything not promoted stays
-in session-local archives, so speculation and half-finished work never become project
-facts.
+working directory, reused by every session that starts there. A manually invoked
+**reviewer** verifies that bank against the current project, merges overlap, and prunes stale
+material. Anything not promoted stays in session-local archives, so speculation and
+half-finished work never become project facts.
 
 This fork implements **one memory model**. It is not a compatible mode of the upstream
 [`amosblomqvist/pi-observational-memory`](https://github.com/amosblomqvist/pi-observational-memory)
@@ -44,8 +45,8 @@ project-identity layer). Three roots with different lifetimes:
 ```
 
 - **`project/` is the only durable recall tier.** Every session in this cwd reads it with
-  ordinary `ls`/`read`/`grep`; the consolidator writes it through scoped tools confined to
-  the bank. Sessions started in different subdirectories get different banks, even within
+  ordinary `ls`/`read`/`grep`; the consolidator and reviewer write it through scoped tools
+  confined to the bank. Sessions started in different subdirectories get different banks, even within
   one repository — to share memory, start pi from the same directory.
 - **`sessions/<sessionId>/archive/`** holds each submitted batch verbatim (JSON, keyed by a
   deterministic batch id) before anything is drained. Anything the consolidator declines to
@@ -72,10 +73,12 @@ flowchart LR
     F[".memory/project/<br/><i>INDEX.md + OVERVIEW.md + topic files —<br/>shared bank for every session in the cwd</i>"]
     G[".memory/sessions/&lt;id&gt;/archive/<br/><i>verbatim batch archive (pre-drain)</i>"]
     H["orientation block<br/><i>OVERVIEW + topic index, bootstrapTokens-bounded</i>"]
+    I["manual reviewer<br/><i>verify, merge, prune;<br/>read-only project inspection</i>"]
 
     A --> B --> C --> D
     C -- "oldest overflow<br/>(pool > consolidateAtPoolTokens)" --> E --> F
     E -. "batch archived first" .-> G
+    I -- "/om:review" --> F
     F --> H
     H -- "new session bootstrap<br/>+ every compaction" --> D
 ```
@@ -115,6 +118,12 @@ flowchart LR
   accepted decision is recorded as accepted, never as done; conflicting claims are never
   resolved by arrival order. OVERVIEW.md is rewritten wholesale each run as an undated,
   current-state orientation — never a running history.
+- **Manual review** (`/om:review` only; never triggered automatically): a reviewer reads every
+  project-memory file, inspects current project source through read-only scoped tools, rewrites
+  stale claims, merges duplicate topics, and deletes obsolete files. It cannot modify project
+  source, inspect `.memory` through its project tools, or read common secret paths. Review runs
+  under the same project lock as consolidation. The orchestrator validates the reviewer's exact
+  per-file completion report and final topic front-matter, then regenerates INDEX.md.
 - **Compaction** (`turn_end` over `compactAtContextTokens`): deterministic and model-free.
   It waits for in-flight observers (or provably skips the wait when none can affect the
   result), snaps the cutoff to an observation chunk boundary, and renders: the **same
@@ -151,23 +160,26 @@ exit.
 ## Concurrency: the project lock
 
 Multiple pi processes in the same cwd share one bank, coordinated by a purely cooperative
-lock file: `.memory/project/.consolidation.lock`, acquired by atomic exclusive create
-before a consolidator touches the shared bank, released after the worker exits.
+project-memory lock file: `.memory/project/.consolidation.lock`, acquired by atomic exclusive
+create before a consolidator or reviewer touches the shared bank, released after its worker
+exits.
 
 - **Background consolidation defers** when the lock is busy (no retry, no spawn; a later
   threshold trigger re-fires; the batch stays active).
 - **`--flush` waits** — retried every 1.5 s, bounded at 60 s total (`PI_OM_FLUSH_LOCK_WAIT_MS`
   / `PI_OM_FLUSH_LOCK_RETRY_MS` env overrides), then reports busy.
+- **`/om:review` waits** with the same defaults (`PI_OM_REVIEW_LOCK_WAIT_MS` /
+  `PI_OM_REVIEW_LOCK_RETRY_MS` overrides), then exits without changing the bank if still busy.
 - **Stale locks are reported, never stolen.** If the recorded pid is dead, `/om:status`
   flags the lock as stale; cleanup is **manual**: verify the pid is really dead, then delete
   `<cwd>/.memory/project/.consolidation.lock`. There is no heartbeat, lease, or automatic
   breaking.
 
-**MVP limitation — consolidation is not transactional.** Individual file writes are atomic
-(temp + rename), but a consolidator run edits several files sequentially; a reader may see a
-mix of complete old and new files mid-run. INDEX.md is generated and rebuildable — it is
-re-rendered from topic front-matter after every successful run, so deleting it is always
-safe.
+**MVP limitation — multi-file writes are not transactional.** Individual file writes are
+atomic (temp + rename), but a worker edits several files sequentially; a reader may see a mix
+of complete old and new files mid-run. A failed or interrupted review can therefore leave
+partial edits; inspect the bank before retrying. INDEX.md is generated and rebuildable — it is
+re-rendered from topic front-matter after every successful run, so deleting it is always safe.
 
 ## Subagents and other launchers
 
@@ -188,10 +200,11 @@ safe.
 | Command | Effect |
 |---|---|
 | `/om`, `/om on`, `/om off` | The per-session on/off gate |
-| `/om:status` | Workers in flight, active observations, next-observer progress, pool/consolidator state, topic-file count, overview size, lock state (incl. stale), context usage, session cost, last error |
+| `/om:status` | Workers in flight, active observations, next-observer progress, pool/consolidator/reviewer state, topic-file count, overview size, lock state (incl. stale), context usage, session cost, last error |
 | `/om:compact` | Force a compaction now (ignores the threshold) |
 | `/om:consolidate` | Force an overflow-only consolidation now (everything above `poolTargetTokens`, ignoring the trigger threshold) |
 | `/om:consolidate --flush` | Full publish before ending a session: tail observation + whole-pool consolidation, awaited, with a final report |
+| `/om:review` | Manually verify, deduplicate, consolidate, and prune the durable project-memory files; never runs automatically |
 
 ## Configuration
 
@@ -201,18 +214,19 @@ Namespace `observational-memory` in `~/.pi/agent/settings.json` (global) or
 ```jsonc
 {
   "observational-memory": {
-    "chunkTokens": 10000,                // raw-history token size of one observation chunk
+    "chunkTokens": 15000,                // raw-history token size of one observation chunk
     "poolTargetTokens": 10000,           // buffer drains back toward this after consolidation
-    "consolidateAtPoolTokens": 15000,    // pool size that triggers a consolidation
-    "compactAtContextTokens": 150000,    // live context usage that triggers compaction
+    "consolidateAtPoolTokens": 25000,    // pool size that triggers a consolidation
+    "compactAtContextTokens": 250000,    // live context usage that triggers compaction
     "tailTokens": 20000,                 // verbatim tail; snaps to a chunk boundary
     "overviewTargetTokens": 1000,        // target size of OVERVIEW.md
     "bootstrapTokens": 2000,             // cap of the injected orientation block (bootstrap + compaction)
     "observerConcurrency": 4,
     "resumeAfterMidRunCompaction": true, // auto-resume after a mid-run compaction
     "models": {
-      "observer":     { "provider": "openrouter", "id": "z-ai/glm-5.3", "thinking": "low" },
-      "consolidator": { "provider": "openrouter", "id": "z-ai/glm-5.3", "thinking": "medium" }
+      "observer":     { "provider": "openrouter", "id": "z-ai/glm-5.3-flash", "thinking": "low" },
+      "consolidator": { "provider": "openrouter", "id": "z-ai/glm-5.3-flash", "thinking": "medium" },
+      "reviewer":     { "provider": "openrouter", "id": "z-ai/glm-5.3-flash", "thinking": "high" }
     },
     "passive": false,
     "debugLog": false
@@ -241,7 +255,8 @@ npm run typecheck # tsc --noEmit
 ```
 
 Layout: `src/` is the master-side orchestrator (entry `src/index.ts`); `agent/` is the shared
-worker extension loaded into subprocesses via `-e` (branching on `OM_WORKER`). Durable memory
+worker extension loaded into subprocesses via `-e` (branching on `OM_WORKER` for observer,
+consolidator, and reviewer roles). Durable memory
 lives under `<cwd>/.memory/project/`, session archives under
 `<cwd>/.memory/sessions/<sessionId>/archive/`, transient worker IPC under
 `<cwd>/.memory/runtime/<sessionId>/runs/`.

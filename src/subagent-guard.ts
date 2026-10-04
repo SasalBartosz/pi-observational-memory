@@ -37,12 +37,12 @@ export function classifyProcessRole(env: NodeJS.ProcessEnv = process.env): Proce
 }
 
 /**
- * Register the minimal stub commands for a suppressed subagent session: `/om`, `/om:consolidate`
- * and `/om:compact` each report suppression instead of activating anything. The ONLY thing
+ * Register the minimal stub commands for a suppressed subagent session: `/om`, `/om:consolidate`,
+ * `/om:review`, and `/om:compact` each report suppression instead of activating anything. The ONLY thing
  * registered — no handlers, no gate, no dirs, no status UI.
  */
 export function registerSubagentStubs(pi: ExtensionAPI): void {
-	for (const name of ["om", "om:consolidate", "om:compact"] as const) {
+	for (const name of ["om", "om:consolidate", "om:review", "om:compact"] as const) {
 		pi.registerCommand(name, {
 			description: `Observational memory (${SUBAGENT_SUPPRESSED_MESSAGE.toLowerCase()})`,
 			handler: async (_args: string, ctx: any) => {

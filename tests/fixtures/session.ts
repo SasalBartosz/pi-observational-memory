@@ -185,7 +185,7 @@ export function observationsArchivedEntry(
 export function costEntry(
 	id: string,
 	costUsd: number,
-	role: "observer" | "consolidator" = "observer",
+	role: "observer" | "consolidator" | "reviewer" = "observer",
 	overrides: Partial<TestEntry> = {},
 ): TestEntry {
 	return {

@@ -41,6 +41,22 @@ export type ConsolidatorRunResult = {
 	outcomes: ConsolidatorOutcome[];
 };
 
+/** The manual reviewer's disposition for one file present at review start. */
+export type ReviewerDisposition = "kept" | "updated" | "merged" | "deleted";
+
+export type ReviewerFileOutcome = {
+	path: string;
+	disposition: ReviewerDisposition;
+};
+
+/** Terminal report emitted by a successful manual project-memory review. */
+export type ReviewerRunResult = {
+	reviewId: string;
+	files: ReviewerFileOutcome[];
+	createdFiles: string[];
+	summary: string;
+};
+
 /**
  * Transient run dir under a session's runtime root. Always called with the session runtime
  * dir (`<cwd>/.memory/runtime/<sessionId>`), so IPC files land in
@@ -62,10 +78,15 @@ export function consolidatorResultPath(runtimeDir: string, runId: string): strin
 	return join(runsDir(runtimeDir), `${runId}.consolidation.json`);
 }
 
+/** The manual reviewer's validated completion report. */
+export function reviewerResultPath(runtimeDir: string, runId: string): string {
+	return join(runsDir(runtimeDir), `${runId}.review.json`);
+}
+
 /**
  * Per-run cost handoff file. Written by the worker EXTENSION (never the model) from pi's
  * built-in `usage.cost.total`, read by the orchestrator after the process exits. Uniform
- * across roles — both observer and consolidator report cost here.
+ * across observer, consolidator, and reviewer roles.
  */
 export function runCostPath(runtimeDir: string, runId: string): string {
 	return join(runsDir(runtimeDir), `${runId}.cost.json`);
@@ -148,4 +169,37 @@ export function readConsolidatorResult(path: string): ConsolidatorRunResult {
 		}
 	}
 	return { batchId: v.batchId, outcomes: v.outcomes };
+}
+
+const REVIEWER_DISPOSITIONS: readonly ReviewerDisposition[] = ["kept", "updated", "merged", "deleted"];
+
+function isReviewerFileOutcome(value: unknown): value is ReviewerFileOutcome {
+	if (!value || typeof value !== "object") return false;
+	const v = value as Record<string, unknown>;
+	return (
+		typeof v.path === "string" &&
+		v.path.length > 0 &&
+		typeof v.disposition === "string" &&
+		(REVIEWER_DISPOSITIONS as readonly string[]).includes(v.disposition)
+	);
+}
+
+export function writeReviewerResult(path: string, result: ReviewerRunResult): void {
+	atomicWrite(path, JSON.stringify(result));
+}
+
+/** Strict parser for the reviewer's terminal completion report. */
+export function readReviewerResult(path: string): ReviewerRunResult {
+	const raw = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+	if (!raw || typeof raw !== "object") throw new Error("reviewer result is not an object");
+	const v = raw as Record<string, unknown>;
+	if (typeof v.reviewId !== "string" || v.reviewId.length === 0) throw new Error("reviewer result missing reviewId");
+	if (!Array.isArray(v.files) || !v.files.every(isReviewerFileOutcome)) {
+		throw new Error("reviewer result has a malformed files array");
+	}
+	if (!Array.isArray(v.createdFiles) || !v.createdFiles.every((file) => typeof file === "string" && file.length > 0)) {
+		throw new Error("reviewer result has a malformed createdFiles array");
+	}
+	if (typeof v.summary !== "string" || v.summary.trim().length === 0) throw new Error("reviewer result missing summary");
+	return { reviewId: v.reviewId, files: v.files, createdFiles: v.createdFiles, summary: v.summary.trim() };
 }

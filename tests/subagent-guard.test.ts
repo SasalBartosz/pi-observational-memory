@@ -76,6 +76,7 @@ describe("classifyProcessRole", () => {
 	it("classifies our own worker subprocesses by OM_WORKER", () => {
 		expect(classifyProcessRole({ OM_WORKER: "observer" })).toBe("worker");
 		expect(classifyProcessRole({ OM_WORKER: "consolidator" })).toBe("worker");
+		expect(classifyProcessRole({ OM_WORKER: "reviewer" })).toBe("worker");
 	});
 
 	it("classifies pi's interactive subagent sessions by either marker", () => {
@@ -107,7 +108,7 @@ describe("extension factory suppression matrix", () => {
 		const pi = makeFakePi();
 		observationalMemory(pi as never);
 		expect(pi.handlers.size).toBe(0);
-		expect([...pi.commands.keys()].sort()).toEqual(["om", "om:compact", "om:consolidate"]);
+		expect([...pi.commands.keys()].sort()).toEqual(["om", "om:compact", "om:consolidate", "om:review"]);
 	});
 
 	it("stub /om on reports suppression and never appends a gate entry", async () => {
@@ -117,10 +118,11 @@ describe("extension factory suppression matrix", () => {
 
 		const notifications: [string, string][] = [];
 		const ctx = { hasUI: true, ui: { notify: (m: string, l: string) => notifications.push([m, l]) } };
-		for (const name of ["om", "om:consolidate", "om:compact"]) {
+		for (const name of ["om", "om:consolidate", "om:review", "om:compact"]) {
 			await pi.commands.get(name)!.handler("on", ctx);
 		}
 		expect(notifications).toEqual([
+			[SUBAGENT_SUPPRESSED_MESSAGE, "warning"],
 			[SUBAGENT_SUPPRESSED_MESSAGE, "warning"],
 			[SUBAGENT_SUPPRESSED_MESSAGE, "warning"],
 			[SUBAGENT_SUPPRESSED_MESSAGE, "warning"],
@@ -180,7 +182,7 @@ describe("extension factory suppression matrix", () => {
 		expect(pi.handlers.has("session_shutdown")).toBe(true);
 		expect(pi.handlers.has("before_agent_start")).toBe(true);
 		expect([...pi.commands.keys()]).toEqual(
-			expect.arrayContaining(["om", "om:status", "om:compact", "om:consolidate"]),
+			expect.arrayContaining(["om", "om:status", "om:compact", "om:consolidate", "om:review"]),
 		);
 
 		// Gate restore from an om.enabled ledger entry (the fork-inherited case, legitimate here).
@@ -218,9 +220,9 @@ describe("extension factory suppression matrix", () => {
 });
 
 describe("registerSubagentStubs (isolated)", () => {
-	it("registers exactly the three stub commands", () => {
+	it("registers exactly the four stub commands", () => {
 		const pi = makeFakePi();
 		registerSubagentStubs(pi as never);
-		expect([...pi.commands.keys()].sort()).toEqual(["om", "om:compact", "om:consolidate"]);
+		expect([...pi.commands.keys()].sort()).toEqual(["om", "om:compact", "om:consolidate", "om:review"]);
 	});
 });

@@ -3,8 +3,9 @@
 A pi extension that gives your project a persistent, shared memory. While you work,
 background **observers** distill the conversation into observations, and a **consolidator**
 promotes established knowledge into a durable memory bank in your project directory
-(`.memory/project/`). Every future pi session started in the same directory begins already
-oriented — decisions, constraints, and conventions from earlier sessions are just there.
+(`.memory/project/`). A manual **reviewer** can verify, merge, and prune that bank as it grows.
+Every future pi session started in the same directory begins already oriented — decisions,
+constraints, and conventions from earlier sessions are just there.
 
 This guide covers installation and everyday use. For architecture and internals, see
 [README.md](README.md).
@@ -51,7 +52,7 @@ The state persists per session and survives resume. `/om` toggles, `/om off` dis
 
 That's it. As you work:
 
-- every ~10k tokens of conversation, a background **observer** subprocess distills what
+- every ~15k tokens of conversation, a background **observer** subprocess distills what
   happened into observations (parallel, invisible to you);
 - when the observation pool grows past its threshold, a background **consolidator** folds
   established knowledge into `.memory/project/` — the shared bank;
@@ -70,7 +71,21 @@ This is the only guaranteed publish: it observes the remaining conversation, con
 the whole pool, and reports promoted / retained / discarded counts when done. If you skip
 it, observations stay in the session archive — kept, but not shared with future sessions.
 
-### 4. Reap the benefits
+### 4. Review the bank when it gets noisy
+
+When topic files accumulate or the project has changed substantially, run:
+
+```
+/om:review
+```
+
+This is manual-only. The reviewer reads every project-memory file, checks technical claims
+against the current project through read-only tools, merges overlap, and removes stale content.
+It cannot modify project source. The command validates the result and regenerates the memory
+index. Reviews are not backed up or rolled back, so inspect the bank if a review is interrupted
+or reports a failure.
+
+### 5. Reap the benefits
 
 Start pi again from the **same directory** and the new session is bootstrapped with the
 project's OVERVIEW and topic index automatically. No command needed.
@@ -87,6 +102,7 @@ project's OVERVIEW and topic index automatically. No command needed.
 | `/om:compact` | Force a context compaction now |
 | `/om:consolidate` | Force consolidation of the overflow now |
 | `/om:consolidate --flush` | **Publish everything before ending a session** |
+| `/om:review` | Manually verify, merge, and prune the shared project-memory bank |
 
 ## Where things live
 
@@ -95,7 +111,7 @@ Everything is under your project's working directory:
 ```text
 <cwd>/.memory/
 ├── project/                  ← the shared, durable bank (INDEX.md, OVERVIEW.md, topics)
-├── sessions/<id>/archive/    ← per-session batch archives (kept, not shared)
+├── sessions/<id>/archive/    ← per-session consolidation batches (kept, not shared)
 └── runtime/                  ← transient worker IPC files (safe to clean periodically)
 ```
 
@@ -103,7 +119,7 @@ Everything is under your project's working directory:
 - **Add `.memory/` to your `.gitignore`** — it's local state, and the lock file and runtime
   metadata must never be committed.
 - Worker subprocesses are ordinary recorded pi sessions; open them in the session browser
-  if you want to inspect exactly what the observers/consolidator saw and did.
+  if you want to inspect exactly what the observers, consolidator, or reviewer saw and did.
 
 ## Configuration
 
@@ -115,12 +131,13 @@ defaults:
 {
   "observational-memory": {
     "models": {
-      "observer":     { "provider": "openrouter", "id": "z-ai/glm-5.3", "thinking": "low" },
-      "consolidator": { "provider": "openrouter", "id": "z-ai/glm-5.3", "thinking": "medium" }
+      "observer":     { "provider": "openrouter", "id": "z-ai/glm-5.3-flash", "thinking": "low" },
+      "consolidator": { "provider": "openrouter", "id": "z-ai/glm-5.3-flash", "thinking": "medium" },
+      "reviewer":     { "provider": "openrouter", "id": "z-ai/glm-5.3-flash", "thinking": "high" }
     },
-    "chunkTokens": 10000,              // conversation size per observation chunk
-    "consolidateAtPoolTokens": 15000,  // pool size that triggers consolidation
-    "compactAtContextTokens": 150000,  // context usage that triggers compaction
+    "chunkTokens": 15000,              // conversation size per observation chunk
+    "consolidateAtPoolTokens": 25000,  // pool size that triggers consolidation
+    "compactAtContextTokens": 250000,  // context usage that triggers compaction
     "observerConcurrency": 4
   }
 }
@@ -130,9 +147,9 @@ See the [README](README.md#configuration) for the full list of knobs.
 
 ## Multiple sessions at once
 
-Running several pi sessions in the same directory is fine — consolidation is coordinated by
-a lock file (`.memory/project/.consolidation.lock`). Background runs simply defer when the
-lock is busy; `--flush` waits up to 60 s for it.
+Running several pi sessions in the same directory is fine — consolidation and review are
+coordinated by a lock file (`.memory/project/.consolidation.lock`). Background consolidations
+simply defer when the lock is busy; `--flush` and `/om:review` wait up to 60 s for it.
 
 If a session crashed while holding the lock, `/om:status` will report the lock as **stale**.
 Cleanup is manual: verify the recorded pid is actually dead, then delete

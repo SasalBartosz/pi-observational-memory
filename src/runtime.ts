@@ -62,6 +62,12 @@ export class Runtime {
 	 */
 	consolidatorLock: LockHandle | undefined;
 
+	/** Manual project-memory review state. Reviews never trigger automatically, but they share
+	 * the project lock with consolidation so only one writer can touch the durable bank. */
+	reviewerInFlight = false;
+	reviewerController: AbortController | undefined;
+	reviewerLock: LockHandle | undefined;
+
 	/**
 	 * coversUpToId of the most-recent chunk DISPATCHED (committed or still in flight). Combined
 	 * with the committed ledger watermark, this is the effective observation watermark: it keeps
@@ -208,6 +214,10 @@ export class Runtime {
 		// manual cleanup — the designed-for failure mode, unlike a double writer.
 		this.consolidatorController?.abort();
 		this.consolidatorController = undefined;
+		// The manual reviewer follows the same rule: abort now, release only from its dispatch
+		// finally after the subprocess has actually closed.
+		this.reviewerController?.abort();
+		this.reviewerController = undefined;
 	}
 
 	/**
@@ -218,6 +228,14 @@ export class Runtime {
 		const handle = this.consolidatorLock;
 		if (!handle) return;
 		this.consolidatorLock = undefined;
+		releaseProjectLock(handle);
+	}
+
+	/** Release the manual review's project lock after its worker has fully exited. */
+	releaseReviewerLock(): void {
+		const handle = this.reviewerLock;
+		if (!handle) return;
+		this.reviewerLock = undefined;
 		releaseProjectLock(handle);
 	}
 

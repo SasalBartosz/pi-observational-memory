@@ -37,6 +37,7 @@ export interface Config {
 	models: {
 		observer: ConfiguredModel;
 		consolidator: ConfiguredModel;
+		reviewer: ConfiguredModel;
 	};
 	/**
 	 * Resume the agent automatically after a compaction that fired mid-run (a `turn_end` with
@@ -51,18 +52,19 @@ export interface Config {
 }
 
 export const DEFAULTS: Config = {
-	chunkTokens: 10_000,
+	chunkTokens: 15_000,
 	poolTargetTokens: 10_000,
-	consolidateAtPoolTokens: 15_000,
-	compactAtContextTokens: 150_000,
+	consolidateAtPoolTokens: 25_000,
+	compactAtContextTokens: 250_000,
 	tailTokens: 20_000,
 	overviewTargetTokens: 1_000,
 	bootstrapTokens: 2_000,
 	observerConcurrency: 4,
 	resumeAfterMidRunCompaction: true,
 	models: {
-		observer: { provider: "openrouter", id: "z-ai/glm-5.3", thinking: "low" },
-		consolidator: { provider: "openrouter", id: "z-ai/glm-5.3", thinking: "medium" },
+		observer: { provider: "openrouter", id: "z-ai/glm-5.3-flash", thinking: "low" },
+		consolidator: { provider: "openrouter", id: "z-ai/glm-5.3-flash", thinking: "medium" },
+		reviewer: { provider: "openrouter", id: "z-ai/glm-5.3-flash", thinking: "high" },
 	},
 	passive: false,
 	debugLog: false,
@@ -123,6 +125,7 @@ function normalizeSettingsConfig(value: Record<string, unknown>, base: Config): 
 		normalized.models = {
 			observer: normalizeModel(value.models.observer, base.models.observer),
 			consolidator: normalizeModel(value.models.consolidator, base.models.consolidator),
+			reviewer: normalizeModel(value.models.reviewer, base.models.reviewer),
 		};
 	}
 	return normalized;

@@ -87,7 +87,7 @@ export type ArchivedBatch = ObservationsArchivedEntryData;
 
 export type CostEntryData = {
 	costUsd: number;
-	role: "observer" | "consolidator";
+	role: "observer" | "consolidator" | "reviewer";
 	runId: string;
 };
 

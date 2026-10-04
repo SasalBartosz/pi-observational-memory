@@ -1,11 +1,11 @@
 /**
- * Cross-process project consolidation lock (plan §4).
+ * Cross-process project-memory writer lock (originally the consolidation lock, plan §4).
  *
- * The lock coordinates independent Pi processes that consolidate into the same shared
- * durable bank (`<projectDir>/.memory/project/`). It is purely cooperative: there is no
- * OS-enforced mutex around the bank's topic files, only this lock file, which must be
- * acquired before a consolidator touches the shared bank and released after the worker
- * has fully exited (call in `finally`).
+ * The lock coordinates independent Pi processes that consolidate or manually review the same
+ * shared durable bank (`<projectDir>/.memory/project/`). It is purely cooperative: there is no
+ * OS-enforced mutex around the bank's topic files, only this lock file, which must be acquired
+ * before a worker touches the shared bank and released after that worker has fully exited
+ * (call in `finally`).
  *
  * Acquisition uses atomic exclusive create (`open(path, "wx")`) — the lock file either
  * comes into existence as ours or it already belongs to someone else; there is no
@@ -29,7 +29,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { debugLog } from "../debug-log.js";
 
-/** The lock file name inside the project bank directory. */
+/** The historical lock filename inside the project bank; shared by consolidation and review. */
 export const CONSOLIDATION_LOCK_FILENAME = ".consolidation.lock";
 
 export interface ProjectLockOwner {
@@ -86,7 +86,7 @@ export function isPidAlive(pid: number): boolean {
 }
 
 /**
- * Acquire the project consolidation lock via atomic exclusive create.
+ * Acquire the project-memory writer lock via atomic exclusive create.
  *
  * Returns a `LockHandle` on success, or `"busy"` when the lock file already exists
  * (whoever created it owns the bank — even if their process has since died; stale
@@ -130,7 +130,7 @@ export function acquireProjectLock(projectDir: string, owner: ProjectLockOwner):
 }
 
 /**
- * Release the project consolidation lock. Owner-checked: the lock file is re-read and
+ * Release the project-memory writer lock. Owner-checked: the lock file is re-read and
  * only unlinked when the token it records matches ours. If the file is missing, or has
  * been replaced by a different owner (token mismatch / unparseable content), the file
  * is left alone — this function logs a warning via `debugLog` and never throws, so it

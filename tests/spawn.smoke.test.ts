@@ -8,11 +8,14 @@ import {
 	consolidatorResultPath,
 	readConsolidatorResult,
 	readObserverResult,
+	readReviewerResult,
+	reviewerResultPath,
 	runCostPath,
 	runResultPath,
 	runsDir,
 	writeConsolidatorResult,
 	writeObserverResult,
+	writeReviewerResult,
 } from "../src/spawn/runs.js";
 import { registerObserverTool } from "../agent/observer/tool.js";
 
@@ -85,6 +88,29 @@ describe("launch argv + env", () => {
 		).toThrow(/batchId/);
 	});
 
+	it("gives the reviewer mutable memory and read-only project roots plus a separate result contract", () => {
+		const runtimeDir = "/proj/.memory/runtime/sess-1";
+		const env = buildWorkerEnv("reviewer", {
+			runtimeDir,
+			projectDir: "/proj/.memory/project",
+			sourceDir: "/proj",
+			runId: "r1",
+			reviewId: "r1",
+		});
+		expect(env.OM_WORKER).toBe("reviewer");
+		expect(env.OM_MEMORY_DIR).toBe("/proj/.memory/project");
+		expect(env.OM_PROJECT_DIR).toBe("/proj");
+		expect(env.OM_REVIEW_ID).toBe("r1");
+		expect(env.OM_RESULT_PATH).toBe(reviewerResultPath(runtimeDir, "r1"));
+	});
+
+	it("refuses a reviewer without all sandbox and contract roots", () => {
+		expect(() => buildWorkerEnv("reviewer", { runtimeDir: "/runtime", runId: "r1" })).toThrow(/projectDir/);
+		expect(() =>
+			buildWorkerEnv("reviewer", { runtimeDir: "/runtime", projectDir: "/memory", runId: "r1", reviewId: "r1" }),
+		).toThrow(/sourceDir/);
+	});
+
 	it("resolves run paths under the session runtime dir's runs/ (outside the durable bank)", () => {
 		expect(runsDir("/proj/.memory/runtime/sess-1")).toBe("/proj/.memory/runtime/sess-1/runs");
 		expect(runResultPath("/proj/.memory/runtime/sess-1", "r")).toBe(
@@ -92,6 +118,9 @@ describe("launch argv + env", () => {
 		);
 		expect(consolidatorResultPath("/proj/.memory/runtime/sess-1", "c")).toBe(
 			"/proj/.memory/runtime/sess-1/runs/c.consolidation.json",
+		);
+		expect(reviewerResultPath("/proj/.memory/runtime/sess-1", "v")).toBe(
+			"/proj/.memory/runtime/sess-1/runs/v.review.json",
 		);
 	});
 });
@@ -143,6 +172,38 @@ describe("consolidator result IPC round-trip", () => {
 			JSON.stringify({ batchId: "b", outcomes: [{ timestamp: "t", disposition: "nope" }] }),
 		);
 		expect(() => readConsolidatorResult(path)).toThrow("malformed outcome");
+	});
+});
+
+describe("reviewer result IPC round-trip", () => {
+	let dir: string;
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "om-review-ipc-"));
+	});
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("writes and reads a strict review report", () => {
+		const path = join(dir, "r.review.json");
+		writeReviewerResult(path, {
+			reviewId: "review-1",
+			files: [{ path: "auth.md", disposition: "updated" }],
+			createdFiles: ["runtime.md"],
+			summary: "Updated auth and split runtime details.",
+		});
+		expect(readReviewerResult(path)).toEqual({
+			reviewId: "review-1",
+			files: [{ path: "auth.md", disposition: "updated" }],
+			createdFiles: ["runtime.md"],
+			summary: "Updated auth and split runtime details.",
+		});
+	});
+
+	it("rejects malformed review dispositions", () => {
+		const path = join(dir, "bad.review.json");
+		writeFileSync(path, JSON.stringify({ reviewId: "r", files: [{ path: "a.md", disposition: "maybe" }], createdFiles: [], summary: "x" }));
+		expect(() => readReviewerResult(path)).toThrow(/files/);
 	});
 });
 
