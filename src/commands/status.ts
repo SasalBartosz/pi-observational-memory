@@ -19,7 +19,21 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 			const branch = ctx.sessionManager.getBranch() as Entry[];
 			const folded = foldLedger(branch);
 			const sinceObservation = rawTokensSinceObservationCoverage(branch);
-			const contextTokens = ctx.getContextUsage?.()?.tokens ?? null;
+			const contextUsage = ctx.getContextUsage?.();
+			const contextTokens = contextUsage?.tokens ?? null;
+			const contextWindow = contextUsage?.contextWindow ?? ctx.model?.contextWindow ?? null;
+			const contextPercent =
+				typeof contextUsage?.percent === "number" && Number.isFinite(contextUsage.percent)
+					? contextUsage.percent
+					: contextTokens != null && contextWindow > 0
+						? (contextTokens / contextWindow) * 100
+						: null;
+			const compactAt = `compact at ${runtime.config.compactAtContextPercent}%`;
+			const contextState =
+				contextWindow > 0
+					? `${contextTokens != null ? contextTokens.toLocaleString() : "?"} / ${contextWindow.toLocaleString()} tok ` +
+						`(${contextPercent != null ? `${contextPercent.toFixed(1)}%; ` : ""}${compactAt})`
+					: `unknown window (${compactAt})`;
 			const pool = poolTokens(folded.activeObservations);
 			const topicCount = listTopics(runtime.projectDir, ctx.cwd).length;
 			const overview = readOverview(runtime.projectDir);
@@ -42,7 +56,7 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 				`  overview: ${overview ? `~${estimateStringTokens(overview).toLocaleString()} / ${runtime.config.overviewTargetTokens.toLocaleString()} tok` : "none yet"}`,
 				`  project memory: ${runtime.projectDir}`,
 				`  project memory lock: ${lockState}`,
-				`  context: ${contextTokens != null ? contextTokens.toLocaleString() : "?"} / ${runtime.config.compactAtContextTokens.toLocaleString()} tok`,
+				`  context: ${contextState}`,
 				`  session cost: $${costUsd.toFixed(4)} (${runs} run${runs === 1 ? "" : "s"})`,
 				runtime.lastWorkerError ? `  last error: ${runtime.lastWorkerError}` : `  last error: none`,
 				"",

@@ -466,7 +466,7 @@ export async function dispatchConsolidator(
 		}
 
 		runtime.status.workerDone(runId, drained);
-		runtime.refreshFooterGauges(ctx.sessionManager.getBranch(), ctx.getContextUsage?.()?.tokens ?? null);
+		runtime.refreshFooterGauges(ctx.sessionManager.getBranch(), ctx.getContextUsage?.());
 		if (ctx.hasUI && ctx.ui) {
 			runtime.queueToast(
 				`om: consolidator promoted ${counts.promoted}, retained ${counts.retained}, discarded ${counts.discarded + screened.length}`,

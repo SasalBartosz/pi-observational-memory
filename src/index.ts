@@ -74,13 +74,20 @@ export default function observationalMemory(pi: ExtensionAPI): void {
 		const branch = ctx.sessionManager.getBranch() as Entry[];
 		runtime.enabled = readGateFromLedger(branch);
 		attachIfEnabled(ctx);
-		runtime.refreshFooterGauges(branch, ctx.getContextUsage?.()?.tokens ?? null);
+		runtime.refreshFooterGauges(branch, ctx.getContextUsage?.());
 		runtime.refreshCost(ctx.sessionManager.getEntries() as Entry[]);
 	});
 
 	pi.on("session_shutdown", () => {
 		runtime.status.detach();
 		runtime.abortAllWorkers();
+	});
+
+	// A model switch can change the context window dramatically. Recompute the percentage gauge
+	// immediately rather than waiting for the next observer or agent turn to refresh it.
+	pi.on("model_select", (_event: unknown, ctx: any) => {
+		if (!runtime.enabled) return;
+		runtime.refreshFooterGauges(ctx.sessionManager.getBranch() as Entry[], ctx.getContextUsage?.());
 	});
 
 	pi.registerCommand("om", {
@@ -98,7 +105,7 @@ export default function observationalMemory(pi: ExtensionAPI): void {
 				runtime.activatePaths(ctx);
 				setDebugLogContext({ enabled: runtime.config.debugLog, cwd: ctx.cwd, sessionId: runtime.sessionId });
 				attachIfEnabled(ctx);
-				runtime.refreshFooterGauges(ctx.sessionManager.getBranch() as Entry[], ctx.getContextUsage?.()?.tokens ?? null);
+				runtime.refreshFooterGauges(ctx.sessionManager.getBranch() as Entry[], ctx.getContextUsage?.());
 				runtime.refreshCost(ctx.sessionManager.getEntries() as Entry[]);
 			} else {
 				runtime.abortAllWorkers();

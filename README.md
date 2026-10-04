@@ -124,9 +124,10 @@ flowchart LR
   source, inspect `.memory` through its project tools, or read common secret paths. Review runs
   under the same project lock as consolidation. The orchestrator validates the reviewer's exact
   per-file completion report and final topic front-matter, then regenerates INDEX.md.
-- **Compaction** (`turn_end` over `compactAtContextTokens`): deterministic and model-free.
-  It waits for in-flight observers (or provably skips the wait when none can affect the
-  result), snaps the cutoff to an observation chunk boundary, and renders: the **same
+- **Compaction** (`turn_end` at `compactAtContextPercent` of the active model window):
+  deterministic and model-free. It waits for in-flight observers (or provably skips the wait
+  when none can affect the result), snaps the cutoff to an observation chunk boundary, and
+  renders: the **same
   orientation block bootstrap uses** (OVERVIEW + topic index, bounded by `bootstrapTokens`)
   + the active observations + a **session archive** section pointing at archived batches.
   A compaction that fires mid-run (with tool results pending) automatically resumes the
@@ -217,7 +218,7 @@ Namespace `observational-memory` in `~/.pi/agent/settings.json` (global) or
     "chunkTokens": 15000,                // raw-history token size of one observation chunk
     "poolTargetTokens": 10000,           // buffer drains back toward this after consolidation
     "consolidateAtPoolTokens": 25000,    // pool size that triggers a consolidation
-    "compactAtContextTokens": 250000,    // live context usage that triggers compaction
+    "compactAtContextPercent": 75,       // % of the active model window that triggers compaction
     "tailTokens": 20000,                 // verbatim tail; snaps to a chunk boundary
     "overviewTargetTokens": 1000,        // target size of OVERVIEW.md
     "bootstrapTokens": 2000,             // cap of the injected orientation block (bootstrap + compaction)
@@ -233,6 +234,11 @@ Namespace `observational-memory` in `~/.pi/agent/settings.json` (global) or
   }
 }
 ```
+
+The context threshold accepts values greater than 0 and below 100 and follows model switches
+automatically: 75% means ~96k tokens on a 128k model and ~750k on a 1M model. Pi's own
+`contextWindow - reserveTokens` safety threshold remains active, so it can compact first when
+that leaves less headroom than the configured percentage.
 
 `PI_OM_PASSIVE=1` forces `passive` (disables all triggers) — a power-user setting distinct
 from the on/off gate, useful for other launchers and clean `/tree` testing.

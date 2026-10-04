@@ -14,5 +14,7 @@ export type TriggerCtx = {
 		getEntries: () => Entry[];
 		getSessionId: () => string;
 	};
-	getContextUsage?: () => { tokens: number | null } | undefined;
+	getContextUsage?: () =>
+		| { tokens: number | null; contextWindow?: number; percent?: number | null }
+		| undefined;
 };

@@ -137,11 +137,14 @@ defaults:
     },
     "chunkTokens": 15000,              // conversation size per observation chunk
     "consolidateAtPoolTokens": 25000,  // pool size that triggers consolidation
-    "compactAtContextTokens": 250000,  // context usage that triggers compaction
+    "compactAtContextPercent": 75,     // % of the active model window that triggers compaction
     "observerConcurrency": 4
   }
 }
 ```
+
+The percentage follows the active model's context window, including model switches. Pi's own
+reserved-token safety threshold may still compact first on smaller windows.
 
 See the [README](README.md#configuration) for the full list of knobs.
 

@@ -15,14 +15,38 @@ const RESUME_PROMPT =
 const RETRYABLE_ERROR_RE =
 	/overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i;
 
-function contextPressureTokens(
-	ctx: { getContextUsage?: () => { tokens: number | null } | undefined; sessionManager: { getBranch: () => Entry[] } },
-	threshold: number,
-): { tokens: number; due: boolean } {
-	const live = ctx.getContextUsage?.()?.tokens;
-	if (live != null) return { tokens: live, due: live >= threshold };
-	const raw = rawTokensSinceLastCompaction(ctx.sessionManager.getBranch());
-	return { tokens: raw, due: raw >= threshold };
+type ContextPressureSource = {
+	getContextUsage?: () =>
+		| { tokens: number | null; contextWindow?: number; percent?: number | null }
+		| undefined;
+	model?: { contextWindow?: number };
+	sessionManager: { getBranch: () => Entry[] };
+};
+
+/** Resolve pressure against the active model window. The raw-history fallback covers contexts
+ * where Pi knows the window but temporarily has no live estimate (notably just after compaction). */
+export function contextPressurePercent(
+	ctx: ContextPressureSource,
+	thresholdPercent: number,
+): { tokens: number; contextWindow: number | null; percent: number | null; due: boolean } {
+	const usage = ctx.getContextUsage?.();
+	const tokens = usage?.tokens ?? rawTokensSinceLastCompaction(ctx.sessionManager.getBranch());
+	const usageWindow = usage?.contextWindow;
+	const modelWindow = ctx.model?.contextWindow;
+	const contextWindow =
+		typeof usageWindow === "number" && usageWindow > 0
+			? usageWindow
+			: typeof modelWindow === "number" && modelWindow > 0
+				? modelWindow
+				: null;
+	const reportedPercent = usage?.percent;
+	const percent =
+		typeof reportedPercent === "number" && Number.isFinite(reportedPercent)
+			? reportedPercent
+			: contextWindow !== null
+				? (tokens / contextWindow) * 100
+				: null;
+	return { tokens, contextWindow, percent, due: percent !== null && percent >= thresholdPercent };
 }
 
 /**
@@ -42,7 +66,7 @@ function turnWillContinue(event: any): boolean {
 }
 
 /**
- * Trigger compaction on `turn_end` once live context usage crosses `compactAtContextTokens`.
+ * Trigger compaction on `turn_end` once live context usage crosses `compactAtContextPercent`.
  *
  * We fire on turn_end (not agent_end) so compaction can kick in BETWEEN turns — pausing the
  * chat immediately — rather than only after the whole agent run settles. We call `ctx.compact()`
@@ -74,7 +98,7 @@ export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): v
 			return;
 		}
 
-		if (!contextPressureTokens(ctx, runtime.config.compactAtContextTokens).due) return;
+		if (!contextPressurePercent(ctx, runtime.config.compactAtContextPercent).due) return;
 
 		// Capture the resume decision NOW, from this turn's event — ctx state at onComplete
 		// (post-abort, post-reload) no longer reflects whether the turn had pending tool work.
@@ -83,7 +107,12 @@ export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): v
 		const hasUI = ctx.hasUI;
 		const ui = ctx.ui;
 		runtime.compactInFlight = true;
-		if (hasUI) ui?.notify("om: context threshold reached — compacting (waiting for in-flight observers)…", "info");
+		if (hasUI) {
+			ui?.notify(
+				`om: context reached ${runtime.config.compactAtContextPercent}% — compacting (waiting for in-flight observers)…`,
+				"info",
+			);
+		}
 
 		// Fire-and-forget. The before-compact hook waits for observers and renders the block.
 		ctx.compact({

@@ -19,7 +19,7 @@ export interface FooterGauges {
 	/** Active pool tokens accrued toward the consolidation threshold. */
 	poolValue: number;
 	poolMax: number;
-	/** Live context-window tokens toward the compaction threshold. */
+	/** Live context-window percentage toward the configured compaction percentage. */
 	ctxValue: number;
 	ctxMax: number;
 }

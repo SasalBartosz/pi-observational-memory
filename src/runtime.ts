@@ -174,16 +174,25 @@ export class Runtime {
 	}
 
 	/** Recompute the live footer gauges (next-observer + pool + context) from the current branch. */
-	refreshFooterGauges(branch: Entry[], contextTokens?: number | null): void {
+	refreshFooterGauges(
+		branch: Entry[],
+		contextUsage?: { tokens: number | null; contextWindow?: number; percent?: number | null },
+	): void {
 		if (!this.enabled) return;
 		const folded = foldLedger(branch);
+		const contextPercent =
+			typeof contextUsage?.percent === "number" && Number.isFinite(contextUsage.percent)
+				? contextUsage.percent
+				: contextUsage?.tokens != null && contextUsage.contextWindow && contextUsage.contextWindow > 0
+					? (contextUsage.tokens / contextUsage.contextWindow) * 100
+					: 0;
 		this.status.setGauges({
 			nextValue: rawTokensSinceObservationCoverage(branch),
 			nextMax: this.config.chunkTokens,
 			poolValue: poolTokens(folded.activeObservations),
 			poolMax: this.config.consolidateAtPoolTokens,
-			ctxValue: contextTokens ?? 0,
-			ctxMax: this.config.compactAtContextTokens,
+			ctxValue: contextPercent,
+			ctxMax: this.config.compactAtContextPercent,
 		});
 	}
 

@@ -14,10 +14,10 @@ export interface Config {
 	chunkTokens: number;
 	/** Target size of the active observation pool; the buffer drains back toward this after consolidation. */
 	poolTargetTokens: number;
-	/** Active-pool token count that triggers a consolidation (200% of target). */
+	/** Active-pool token count that triggers consolidation. */
 	consolidateAtPoolTokens: number;
-	/** Live context-window usage that triggers compaction. */
-	compactAtContextTokens: number;
+	/** Percentage of the active model's context window that triggers compaction. */
+	compactAtContextPercent: number;
 	/** Verbatim raw tail kept after the cutoff; snaps to a chunk boundary. */
 	tailTokens: number;
 	/**
@@ -55,7 +55,7 @@ export const DEFAULTS: Config = {
 	chunkTokens: 15_000,
 	poolTargetTokens: 10_000,
 	consolidateAtPoolTokens: 25_000,
-	compactAtContextTokens: 250_000,
+	compactAtContextPercent: 75,
 	tailTokens: 20_000,
 	overviewTargetTokens: 1_000,
 	bootstrapTokens: 2_000,
@@ -77,6 +77,10 @@ const PASSIVE_ENV = "PI_OM_PASSIVE";
 
 function positiveIntegerOrUndefined(value: unknown): number | undefined {
 	return Number.isInteger(value) && typeof value === "number" && value > 0 ? value : undefined;
+}
+
+function contextPercentOrUndefined(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 && value < 100 ? value : undefined;
 }
 
 function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
@@ -107,7 +111,6 @@ function normalizeSettingsConfig(value: Record<string, unknown>, base: Config): 
 		"chunkTokens",
 		"poolTargetTokens",
 		"consolidateAtPoolTokens",
-		"compactAtContextTokens",
 		"tailTokens",
 		"overviewTargetTokens",
 		"bootstrapTokens",
@@ -117,6 +120,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>, base: Config): 
 		const normalizedValue = positiveIntegerOrUndefined(value[key]);
 		if (normalizedValue !== undefined) normalized[key] = normalizedValue;
 	}
+	const compactAtContextPercent = contextPercentOrUndefined(value.compactAtContextPercent);
+	if (compactAtContextPercent !== undefined) normalized.compactAtContextPercent = compactAtContextPercent;
 	if (typeof value.resumeAfterMidRunCompaction === "boolean")
 		normalized.resumeAfterMidRunCompaction = value.resumeAfterMidRunCompaction;
 	if (typeof value.passive === "boolean") normalized.passive = value.passive;

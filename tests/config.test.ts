@@ -3,8 +3,8 @@ import { describe, expect, it } from "vitest";
 import { DEFAULTS } from "../src/config.js";
 
 describe("observational-memory defaults", () => {
-	it("uses the requested token thresholds", () => {
-		expect(DEFAULTS.compactAtContextTokens).toBe(250_000);
+	it("uses the requested observation thresholds and adaptive context percentage", () => {
+		expect(DEFAULTS.compactAtContextPercent).toBe(75);
 		expect(DEFAULTS.chunkTokens).toBe(15_000);
 		expect(DEFAULTS.consolidateAtPoolTokens).toBe(25_000);
 	});
