@@ -90,7 +90,6 @@ export function validateReviewerResult(
 	projectDir: string,
 ): { counts: { kept: number; updated: number; merged: number; deleted: number; created: number } } {
 	if (result.reviewId !== reviewId) throw new Error(`reviewId "${result.reviewId}" does not match "${reviewId}"`);
-	if (result.summary.length > 1_000) throw new Error("review summary exceeds 1000 characters");
 	const seen = new Set<string>();
 	const counts = { kept: 0, updated: 0, merged: 0, deleted: 0, created: 0 };
 	for (const file of result.files) {
@@ -244,7 +243,7 @@ export function registerReviewCommand(pi: ExtensionAPI, runtime: Runtime): void 
 			}
 
 			runtime.reviewerInFlight = true;
-			notify("om: reviewing project memory (waiting for the project lock if needed)…", "info");
+			notify("om: reviewing project memory…", "info");
 			let result: ReviewResult;
 			try {
 				result = await runMemoryReview(pi, runtime, ctx);

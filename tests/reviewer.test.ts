@@ -10,7 +10,7 @@ vi.mock("../src/spawn/launch.js", async (importOriginal) => {
 
 import { registerReviewerTools } from "../agent/reviewer/tools.js";
 import { DEFAULTS } from "../src/config.js";
-import { runMemoryReview } from "../src/commands/review.js";
+import { runMemoryReview, validateReviewerResult } from "../src/commands/review.js";
 import { inspectProjectLock } from "../src/memory/lock.js";
 import { Runtime } from "../src/runtime.js";
 import { spawnWorker } from "../src/spawn/launch.js";
@@ -65,6 +65,28 @@ afterEach(() => {
 });
 
 describe("manual reviewer orchestration", () => {
+	it("accepts a detailed review summary without an arbitrary length cap", () => {
+		const h = makeHarness();
+		const summary = "Detailed maintenance outcome. ".repeat(1_000);
+
+		expect(() =>
+			validateReviewerResult(
+				{
+					reviewId: "review-long-summary",
+					files: [
+						{ path: "OVERVIEW.md", disposition: "kept" },
+						{ path: "stale.md", disposition: "kept" },
+					],
+					createdFiles: [],
+					summary,
+				},
+				"review-long-summary",
+				["OVERVIEW.md", "stale.md"],
+				h.projectDir,
+			),
+		).not.toThrow();
+	});
+
 	it("reviews under the project lock, validates the report, and regenerates INDEX", async () => {
 		const h = makeHarness();
 		spawnMock.mockImplementationOnce(async (opts) => {

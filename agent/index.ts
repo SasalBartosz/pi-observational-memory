@@ -70,7 +70,7 @@ const ReportMemoryReviewSchema = Type.Object({
 		{ description: "Exactly one outcome for every memory file present at review start." },
 	),
 	createdFiles: Type.Array(Type.String(), { description: "Every newly created memory filename; empty when none." }),
-	summary: Type.String({ description: "A short factual summary of the review changes." }),
+	summary: Type.String({ description: "A factual summary of the review changes, as detailed as needed." }),
 });
 
 type ReportMemoryReviewInput = Static<typeof ReportMemoryReviewSchema>;

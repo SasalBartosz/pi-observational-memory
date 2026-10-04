@@ -30,7 +30,7 @@ Completion contract:
 - Include one outcome for EVERY memory file that existed when the review began, each exactly once: kept, updated, merged, or deleted.
 - Use merged only when that file was removed after its useful content was folded into another file. Both merged and deleted files must no longer exist.
 - List every newly created memory file in createdFiles. Do not list pre-existing files there.
-- Give a short factual summary of the maintenance performed.
+- Give a factual summary of the maintenance performed, with as much detail as the review needs.
 - Then emit one brief plain-text confirmation and stop.
 
 A missing or inconsistent report makes the run fail. Edits are not automatically rolled back, so complete the review carefully and make the final report exact. Accuracy and a complete report matter more than making changes.`;
