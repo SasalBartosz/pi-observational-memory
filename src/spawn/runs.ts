@@ -35,7 +35,13 @@ export type ConsolidatorOutcome = {
 	disposition: ConsolidatorDisposition;
 };
 
-/** The consolidator result contract: every submitted observation accounted for exactly once. */
+/** Authoritative 1-based index -> timestamp mapping, shared with the worker extension. */
+export type ConsolidatorBatch = {
+	batchId: string;
+	timestamps: string[];
+};
+
+/** Explicit acknowledgements; a partial report leaves unreported observations active. */
 export type ConsolidatorRunResult = {
 	batchId: string;
 	outcomes: ConsolidatorOutcome[];
@@ -76,6 +82,11 @@ export function runResultPath(runtimeDir: string, runId: string): string {
  */
 export function consolidatorResultPath(runtimeDir: string, runId: string): string {
 	return join(runsDir(runtimeDir), `${runId}.consolidation.json`);
+}
+
+/** Per-run index mapping. Only the worker extension reads it, not the model's file tools. */
+export function consolidatorBatchPath(runtimeDir: string, runId: string): string {
+	return join(runsDir(runtimeDir), `${runId}.batch.json`);
 }
 
 /** The manual reviewer's validated completion report. */
@@ -133,6 +144,31 @@ export function writeObserverResult(path: string, result: ObserverRunResult): vo
 	atomicWrite(path, JSON.stringify(result));
 }
 
+export function writeConsolidatorBatch(path: string, batch: ConsolidatorBatch): void {
+	atomicWrite(path, JSON.stringify(batch));
+}
+
+/** Strictly read the orchestrator-owned mapping; indices must identify unique observations. */
+export function readConsolidatorBatch(path: string): ConsolidatorBatch {
+	const raw = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+	if (!raw || typeof raw !== "object") throw new Error("consolidator batch is not an object");
+	const v = raw as Record<string, unknown>;
+	if (typeof v.batchId !== "string" || v.batchId.trim().length === 0) {
+		throw new Error("consolidator batch missing batchId");
+	}
+	if (
+		!Array.isArray(v.timestamps) || v.timestamps.length === 0 ||
+		!v.timestamps.every((timestamp: unknown) => typeof timestamp === "string" && timestamp.trim().length > 0)
+	) {
+		throw new Error("consolidator batch requires a nonempty timestamps array of observation ids");
+	}
+	const timestamps = v.timestamps as string[];
+	if (new Set(timestamps).size !== timestamps.length) {
+		throw new Error("consolidator batch contains duplicate timestamps");
+	}
+	return { batchId: v.batchId, timestamps };
+}
+
 const DISPOSITIONS: readonly ConsolidatorDisposition[] = ["promoted", "retained", "discarded"];
 
 function isConsolidatorOutcome(value: unknown): value is ConsolidatorOutcome {
@@ -150,11 +186,7 @@ export function writeConsolidatorResult(path: string, result: ConsolidatorRunRes
 	atomicWrite(path, JSON.stringify(result));
 }
 
-/**
- * Parse + validate a consolidator result file. Strict (throws on any malformed field, no
- * silent filtering): this is the validated-outcome contract the orchestrator checks before
- * tombstoning, so a partial or malformed report must fail loudly.
- */
+/** Reject malformed entries without filtering; batch membership/coverage is checked by the caller. */
 export function readConsolidatorResult(path: string): ConsolidatorRunResult {
 	const raw = JSON.parse(readFileSync(path, "utf-8")) as unknown;
 	if (!raw || typeof raw !== "object") throw new Error("consolidator result is not an object");

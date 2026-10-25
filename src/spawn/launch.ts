@@ -113,8 +113,8 @@ export type WorkerLaunchEnv = {
 	projectDir?: string;
 	/** Reviewer only: the project cwd exposed through read-only inspection tools. */
 	sourceDir?: string;
-	/** Consolidator only: the deterministic batch id that pins its outcome contract. */
-	batchId?: string;
+	/** Consolidator only: the batch manifest (batch id + 1-based index -> timestamp mapping). */
+	batchPath?: string;
 	/** Reviewer only: id echoed in the terminal review report. */
 	reviewId?: string;
 };
@@ -123,7 +123,8 @@ export type WorkerLaunchEnv = {
  * Build the env a worker subprocess needs, split by role. Every role gets result/cost IPC
  * paths under the transient session runtime dir. Consolidator and reviewer get OM_MEMORY_DIR
  * for scoped bank mutation; only the reviewer also gets OM_PROJECT_DIR for read-only source
- * inspection. Kickoff input travels as the recorded `pi -p` prompt, not via env/file.
+ * inspection. Kickoff input travels as the recorded `pi -p` prompt. The consolidator's
+ * extension additionally receives an index manifest for validating the reporting tool.
  */
 export function buildWorkerEnv(role: "observer" | "consolidator" | "reviewer", opts: WorkerLaunchEnv): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = {
@@ -144,14 +145,14 @@ export function buildWorkerEnv(role: "observer" | "consolidator" | "reviewer", o
 		if (!opts.projectDir) {
 			throw new Error("consolidator worker requires projectDir (the shared-bank sandbox)");
 		}
-		if (!opts.batchId) {
-			throw new Error("consolidator worker requires batchId (the validated-outcome contract)");
+		if (!opts.batchPath) {
+			throw new Error("consolidator worker requires batchPath (the authoritative index mapping)");
 		}
+		// The manifest carries the batch id the worker must echo back; the orchestrator
+		// rejects a result file whose batchId does not match the submitted batch.
+		env.OM_BATCH_PATH = opts.batchPath;
 		// Sandbox root for the consolidator's scoped file tools (design risk 6).
 		env.OM_MEMORY_DIR = opts.projectDir;
-		// The batch id the worker must echo back in report_consolidation_outcomes; the
-		// orchestrator rejects a result file whose batchId does not match the submitted batch.
-		env.OM_BATCH_ID = opts.batchId;
 	}
 	if (role === "reviewer") {
 		if (!opts.projectDir) throw new Error("reviewer worker requires projectDir (the shared-bank sandbox)");

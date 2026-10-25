@@ -11,40 +11,16 @@ import {
 } from "../hooks/consolidator-trigger.js";
 import { flushObserverTail } from "../hooks/observer-trigger.js";
 
-/**
- * `/om:consolidate` — force consolidation NOW.
- *
- * Without `--flush`: overflow-only — promote the oldest observations above `poolTargetTokens`,
- * fired even when the pool is below `consolidateAtPoolTokens` (an explicit selection, never a
- * threshold hack). Fire-and-forget like a background trigger.
- *
- * `--flush` (plan §8, short-session/end-of-task): the full pipeline, awaited synchronously so
- * the user gets a final report and knows it is safe to leave:
- *   1. tail observation — one observer over the remaining uncovered conversation, even below
- *      `chunkTokens` (`flushObserverTail`, which first waits for in-flight observers);
- *   2. full-pool consolidation — ALL active observations, bypassing both the pool threshold
- *      and the overflow selection;
- *   3. bounded lock wait — the project lock is retried for up to FLUSH_LOCK_WAIT_TIMEOUT_MS
- *      (cancellable via ctx.signal when the agent provides one); on timeout the flush reports
- *      the holder (inspectProjectLock) and exits WITHOUT spawning.
- *
- * Gates: no-op with a message when om is off; refused when passive (passive = no workers,
- * including flush). The flush's own report carries promoted / retained / discarded counts plus
- * the archive path from the om.observations.archived entry.
- */
+/** Flush retries only the original selection, and only while observations actually drain. */
+export const MAX_FLUSH_CONSOLIDATION_ATTEMPTS = 3;
 
-/** Lock-wait bounds are env-overridable so tests (or operators) can shrink them. */
 function flushLockWaitEnvOverride(name: string, fallback: number): number {
 	const raw = process.env[name];
 	const parsed = typeof raw === "string" ? Number(raw) : NaN;
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
-/**
- * Bounded wait for an in-process consolidator run started earlier (a background trigger that
- * fired before the command). Returns false when it is still running after the budget — the
- * flush defers to it rather than racing the in-process guard.
- */
+/** Wait for a background consolidator before selecting the flush's full batch. */
 async function waitForConsolidatorIdle(runtime: Runtime, timeoutMs: number): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
 	while (runtime.consolidatorInFlight) {
@@ -64,7 +40,6 @@ export function registerConsolidateCommand(pi: ExtensionAPI, runtime: Runtime): 
 				if (ctx.hasUI) ctx.ui.notify(message, level);
 			};
 
-			// Gates: off → no-op with a message; passive → refuse (passive = no workers at all).
 			if (!runtime.enabled) {
 				notify("om is off (use /om on to enable)", "info");
 				return;
@@ -80,10 +55,6 @@ export function registerConsolidateCommand(pi: ExtensionAPI, runtime: Runtime): 
 				return;
 			}
 
-			// ── Non-flush: explicit overflow-only consolidation. ─────────────────────────
-			// Same selection the background trigger would make (everything above
-			// poolTargetTokens), but fired regardless of consolidateAtPoolTokens — no
-			// threshold mutation, just the direct dispatch path.
 			if (runtime.consolidatorInFlight) {
 				notify("om: consolidation already in progress", "warning");
 				return;
@@ -99,8 +70,6 @@ export function registerConsolidateCommand(pi: ExtensionAPI, runtime: Runtime): 
 				return;
 			}
 			notify(`om: consolidator started (${promote.length} obs, ~${poolTokens(promote).toLocaleString()} tok)`, "info");
-			// Same one-at-a-time guard the threshold trigger holds; dispatchConsolidator resets
-			// it in its finally. The .catch covers a (theoretical) pre-try prologue throw.
 			runtime.consolidatorInFlight = true;
 			void dispatchConsolidator(pi, runtime, ctx, promote).catch(() => {
 				runtime.consolidatorInFlight = false;
@@ -115,15 +84,10 @@ async function runFlush(
 	ctx: any,
 	notify: (message: string, level: "info" | "warning" | "error") => void,
 ): Promise<void> {
-	// ── 1. Tail observation: whatever remains uncovered, even below chunkTokens. ────────
-	// flushObserverTail first awaits any in-flight observers, so a chunk dispatched moments
-	// ago is never double-observed.
+	const sessionId = ctx.sessionManager.getSessionId();
 	notify("om: flush — observing the remaining conversation…", "info");
 	await flushObserverTail(pi, runtime, ctx);
 
-	// ── 2. Full-pool consolidation — ALL active observations, no overflow selection. ────
-	// A background consolidator may have fired just before the command: wait for it (bounded)
-	// so this pass sees the settled pool instead of racing the in-process guard.
 	if (!(await waitForConsolidatorIdle(runtime, FLUSH_LOCK_WAIT_TIMEOUT_MS))) {
 		notify(
 			"om: flush deferred — a consolidation started earlier is still running; run /om:consolidate --flush again when it finishes",
@@ -132,74 +96,117 @@ async function runFlush(
 		return;
 	}
 
-	const branch = ctx.sessionManager.getBranch() as Entry[];
-	const active = foldLedger(branch).activeObservations;
-	if (active.length === 0) {
-		notify("om: flush complete — nothing to consolidate", "info");
+	// An empty pool falls through: the loop's session/abort checks run first, then it completes.
+	const active = foldLedger(ctx.sessionManager.getBranch() as Entry[]).activeObservations;
+	if (active.length > 0) notify(`om: flushing — consolidating ${active.length} observation(s)…`, "info");
+	debugLog("flush.consolidate", { observations: active.length, poolTokens: poolTokens(active) });
+
+	// The ledger, not the worker's claimed coverage, determines what needs another attempt.
+	const selected = new Set(active.map((observation) => observation.timestamp));
+	const counts = { promoted: 0, retained: 0, discarded: 0 };
+	let drainedTotal = 0;
+	let archivePath: string | undefined;
+	let lastError: string | undefined;
+	let attempts = 0;
+	let stopReason: ConsolidatorDispatchResult["outcome"] | "session-replaced" | "aborted" = "completed";
+
+	while (attempts < MAX_FLUSH_CONSOLIDATION_ATTEMPTS) {
+		if (ctx.sessionManager.getSessionId() !== sessionId) {
+			stopReason = "session-replaced";
+			break;
+		}
+		if (!runtime.enabled || ctx.signal?.aborted) {
+			stopReason = "aborted";
+			break;
+		}
+		const batch = foldLedger(ctx.sessionManager.getBranch() as Entry[]).activeObservations
+			.filter((observation) => selected.has(observation.timestamp));
+		if (batch.length === 0) {
+			stopReason = "completed";
+			break;
+		}
+
+		attempts += 1;
+		runtime.consolidatorInFlight = true;
+		let result: ConsolidatorDispatchResult;
+		try {
+			result = await dispatchConsolidator(pi, runtime, ctx, batch, {
+				acquireLock: (projectDir, owner, signal) =>
+					waitForProjectLock(projectDir, owner, {
+						timeoutMs: flushLockWaitEnvOverride("PI_OM_FLUSH_LOCK_WAIT_MS", FLUSH_LOCK_WAIT_TIMEOUT_MS),
+						retryDelayMs: flushLockWaitEnvOverride("PI_OM_FLUSH_LOCK_RETRY_MS", FLUSH_LOCK_RETRY_DELAY_MS),
+						signal: ctx.signal ? AbortSignal.any([signal, ctx.signal]) : signal,
+					}),
+			});
+		} catch (error) {
+			// Also reset the guard if dispatch fails before entering its own try/finally.
+			runtime.consolidatorInFlight = false;
+			result = { outcome: "failed", error: error instanceof Error ? error.message : String(error) };
+		}
+
+		// Preserve the full-batch archive rather than replacing it with a retry's subset.
+		archivePath ??= result.archivePath;
+		// Count before any stop check: bank writes stand even when the tombstone is skipped.
+		if (result.counts) {
+			counts.promoted += result.counts.promoted;
+			counts.retained += result.counts.retained;
+			counts.discarded += result.counts.discarded;
+		}
+		counts.discarded += result.screened ?? 0;
+		drainedTotal += result.drained ?? 0;
+
+		if (result.tombstoneSkipped || ctx.sessionManager.getSessionId() !== sessionId) {
+			stopReason = "session-replaced";
+			break;
+		}
+		if (!runtime.enabled || ctx.signal?.aborted) {
+			stopReason = "aborted";
+			break;
+		}
+		stopReason = result.outcome;
+		lastError = result.error ?? result.lockMessage;
+		if (result.outcome !== "partial" || (result.drained ?? 0) === 0) break;
+	}
+
+	// New observations are excluded from retries, but still prevent a completion claim.
+	const stillActive = foldLedger(ctx.sessionManager.getBranch() as Entry[]).activeObservations.length;
+	if ((stopReason === "completed" || stopReason === "all-screened") && stillActive > 0) stopReason = "partial";
+	debugLog("flush.report", { outcome: stopReason, attempts, drained: drainedTotal, stillActive, counts });
+
+	if (stopReason === "completed" || stopReason === "all-screened") {
+		const summary = attempts === 0
+			? "nothing to consolidate"
+			: `promoted ${counts.promoted}, retained in archive ${counts.retained}, discarded ${counts.discarded}` +
+				(archivePath ? `; archive: ${archivePath}` : "") + ". Safe to leave this session.";
+		notify(`om: flush complete — ${summary}`, "info");
 		return;
 	}
 
-	notify(`om: flushing — consolidating ${active.length} observation(s)…`, "info");
-	debugLog("flush.consolidate", { observations: active.length, poolTokens: poolTokens(active) });
-	runtime.consolidatorInFlight = true;
-	let result: ConsolidatorDispatchResult;
-	try {
-		result = await dispatchConsolidator(pi, runtime, ctx, active, {
-			// Bounded, cancellable lock wait — the user is waiting, so a busy lock is retried,
-			// never silently deferred. ctx.signal is the agent's abort signal (usually
-			// undefined for commands run while idle — the timeout is the practical bound).
-			acquireLock: (projectDir, owner) =>
-				waitForProjectLock(projectDir, owner, {
-					timeoutMs: flushLockWaitEnvOverride("PI_OM_FLUSH_LOCK_WAIT_MS", FLUSH_LOCK_WAIT_TIMEOUT_MS),
-					retryDelayMs: flushLockWaitEnvOverride("PI_OM_FLUSH_LOCK_RETRY_MS", FLUSH_LOCK_RETRY_DELAY_MS),
-					signal: ctx.signal,
-				}),
-		});
-	} catch (error) {
-		// dispatchConsolidator never rejects in practice (it catches internally); this covers a
-		// pre-try prologue throw so the guard never sticks.
-		runtime.consolidatorInFlight = false;
-		result = { outcome: "failed", error: error instanceof Error ? error.message : String(error) };
-	}
-
-	debugLog("flush.report", { outcome: result.outcome, drained: result.drained, counts: result.counts });
-	switch (result.outcome) {
-		case "completed": {
-			const counts = result.counts ?? { promoted: 0, retained: 0, discarded: 0 };
-			const discarded = counts.discarded + (result.screened ?? 0);
-			let line =
-				`om: flush complete — promoted ${counts.promoted}, retained locally ${counts.retained}, discarded ${discarded}` +
-				(result.archivePath ? `; archive: ${result.archivePath}` : "") +
-				". Safe to leave this session.";
-			if (result.tombstoneSkipped) {
-				line += " (The session was replaced during the run — the observations remain active; flush again in the new session.)";
-			}
-			notify(line, "info");
-			return;
-		}
-		case "all-screened":
-			notify(
-				`om: flush complete — ${result.drained ?? 0} observation(s) looked secret and were discarded locally (never sent to a worker). Safe to leave this session.`,
-				"info",
-			);
-			return;
+	const progress = `promoted ${counts.promoted}, retained in archive ${counts.retained}, discarded ${counts.discarded}`;
+	const remaining = `${stillActive} observation(s) remain active`;
+	const retry = "Not safe to leave — run /om:consolidate --flush again.";
+	let message: string;
+	let level: "warning" | "error" = "warning";
+	switch (stopReason) {
 		case "lock-busy":
-			notify(
-				`om: flush busy — the project memory lock is ${result.lockMessage ?? "held by another process"}; nothing was consolidated. ` +
-					"Run /om:consolidate --flush again later.",
-				"warning",
-			);
-			return;
-		case "deferred":
-			// Only reachable with the default (single-try) lock waiter — i.e. never from the
-			// flush path. Handled for completeness.
-			notify("om: flush deferred — the project memory lock is held by another process", "warning");
-			return;
+			message =
+				`busy — the project memory lock is ${lastError ?? "held by another process"}; ` +
+				`${drainedTotal} observation(s) consolidated, ${remaining}. Run /om:consolidate --flush again later.`;
+			break;
 		case "failed":
-			notify(
-				`om: flush failed: ${result.error} — the observations remain active; run /om:consolidate --flush again.`,
-				"error",
-			);
-			return;
+			message = `failed: ${lastError ?? "consolidation did not complete"} — ${progress}; ${remaining}. ${retry}`;
+			level = "error";
+			break;
+		case "aborted":
+			message = `aborted — ${progress}; ${remaining}. ${retry}`;
+			break;
+		case "session-replaced":
+			message =
+				`incomplete — the session was replaced during consolidation; ${progress}; ` +
+				`${remaining} in the new session. Not safe to leave — flush again there.`;
+			break;
+		default:
+			message = `incomplete — ${progress}; ${remaining} after ${attempts} attempt(s). ${retry}`;
 	}
+	notify(`om: flush ${message}`, level);
 }

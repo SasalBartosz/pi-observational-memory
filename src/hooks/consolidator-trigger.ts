@@ -1,45 +1,8 @@
 /**
- * Consolidator clock + dispatch. When the active observation pool crosses `consolidateAtPoolTokens`,
- * promote the oldest observations (above `poolTargetTokens`) into durable `.memory/project/`
- * topic files via a subprocess consolidator, then drain exactly the batch it submitted — and
- * only after the worker's outcome report VALIDATES.
- *
- * Runs in the BACKGROUND, mirroring the observer trigger (turn_end / agent_start), strictly
- * one at a time in-process (`consolidatorInFlight`, design risk 4) and one at a time
- * cross-process (the project lock, plan §4). Compaction does not wait for it (R5).
- *
- * Dispatch ordering (plan §7d), strict:
- *   1. Archive first: the submitted batch is written verbatim to the session-local archive
- *      under a deterministic batch id BEFORE anything is drained (idempotent by name, so a
- *      retry/replay of the same batch merges instead of duplicating). Secret-looking
- *      observations are screened out of both the archive and the submitted batch and are
- *      accounted as immediately discarded — they drain with the batch after validation.
- *   2. Acquire the project lock BEFORE reading the shared bank or building the prompt.
- *      Busy: the background dispatch defers silently (info-level notice at most, no retry —
- *      a later threshold trigger re-fires; the batch stays active and retryable).
- *   3. Build the prompt from FRESH bank state (post-lock): current index + current OVERVIEW
- *      + the batch lines + the batch id + the outcome-file contract. Nothing dated anywhere.
- *   4. Spawn the worker with the split env including OM_BATCH_ID.
- *   5. On exit: record cost, then VALIDATE the outcome file — it must exist and parse, its
- *      batchId must match, and its outcomes must account for every submitted timestamp
- *      exactly once (no missing, no extras, no duplicates). Worker exit code 0 alone is NOT
- *      success. On missing/invalid outcomes the whole batch stays active (retryable — no
- *      tombstone), the lock is released, and the failure is reported.
- *   6. INDEX.md is regenerated under the same lock, THEN the batch is tombstoned — the
- *      acknowledgement lands only after successful publication AND index generation (the
- *      proposal's explicit ordering; the reverse would make a post-tombstone index failure
- *      or crash non-retryable). Tombstone only submitted timestamps still active on the
- *      originating branch (an observation an observer committed mid-run is not in the handed
- *      batch and must survive; forked branches keep their copies). Secret-screened
- *      timestamps join the tombstone set — they were never submitted but must drain too.
- *      Index → tombstone stay one critical section: a crash between them leaves the batch
- *      active and retryable, and the replay merges by deterministic batch id.
- *   7. Release the lock in `finally`, after the worker process has exited.
- *   8. Session identity: the dispatching session id is captured up front and re-checked before
- *      ANY ledger commit — a session replacement between dispatch and commit must never land
- *      this run's tombstone in the NEW session's ledger (the archive entry at step 1 is fine:
- *      it is written pre-spawn, into the session that dispatched). The bank writes are
- *      project-scoped and stand regardless.
+ * Background consolidation: archive, lock, run the worker, validate, publish INDEX, then drain.
+ * Only explicit acknowledgements (plus screened secrets) drain; omissions remain active.
+ * The lock stays held until the worker exits and publication finishes. Ledger commits must
+ * stay in the originating session, even though bank writes are shared across sessions.
  */
 import { createHash } from "node:crypto";
 import { join, relative } from "node:path";
@@ -49,7 +12,6 @@ import {
 	OM_OBSERVATIONS_DROPPED,
 	foldLedger,
 	lastSourceEntryId,
-	observationToLine,
 	poolTokens,
 	selectPromotionOverflow,
 	sortObservations,
@@ -63,16 +25,16 @@ import { atomicWrite, indexPath, listTopics, readOverview } from "../memory/path
 import { screenSecrets } from "../memory/secrets.js";
 import type { Runtime } from "../runtime.js";
 import { buildWorkerArgv, buildWorkerEnv, spawnWorker } from "../spawn/launch.js";
-import { consolidatorResultPath, readConsolidatorResult, type ConsolidatorRunResult } from "../spawn/runs.js";
+import {
+	consolidatorBatchPath,
+	consolidatorResultPath,
+	readConsolidatorResult,
+	writeConsolidatorBatch,
+	type ConsolidatorRunResult,
+} from "../spawn/runs.js";
 import { recordWorkerCost } from "./observer-trigger.js";
 import { nextRunId } from "../ids.js";
 import type { TriggerCtx } from "./trigger-ctx.js";
-
-// ── Flush lock wait (plan §4/§8) ────────────────────────────────────────────────────────
-// The background path defers on a busy lock (a later threshold trigger re-fires). An explicit
-// /om:consolidate --flush cannot defer — the user is waiting — so it retries acquisition with
-// a short delay under a total-time bound. The retry lives HERE (caller side), never in the
-// lock module, and never spawns a worker while waiting.
 
 /** Total budget an explicit flush waits for a foreign lock holder before reporting "busy". */
 export const FLUSH_LOCK_WAIT_TIMEOUT_MS = 60_000;
@@ -117,7 +79,8 @@ export async function waitForProjectLock(
 	options: FlushLockWaitOptions = {},
 ): Promise<LockHandle | "busy"> {
 	const timeoutMs = options.timeoutMs ?? FLUSH_LOCK_WAIT_TIMEOUT_MS;
-	const retryDelayMs = options.retryDelayMs ?? FLUSH_LOCK_RETRY_DELAY_MS;
+	const retryDelayMs = Math.max(1, options.retryDelayMs ?? FLUSH_LOCK_RETRY_DELAY_MS);
+	if (options.signal?.aborted) return "busy";
 
 	let lock = acquireProjectLock(projectDir, owner);
 	if (lock !== "busy") return lock;
@@ -141,27 +104,22 @@ export async function waitForProjectLock(
 	return "busy";
 }
 
-/**
- * Deterministic batch id: a short sha256 of the source session id + the batch's observation
- * timestamps (sorted). Retries/replays of the same batch derive the same id, so the archive
- * write is idempotent by name and a replayed batch merges instead of duplicating (the
- * consolidator prompt's rewrite-in-place semantics handle the bank side the same way).
- */
+/** Stable across retries of the same selection, making archive writes idempotent. */
 export function deriveBatchId(sessionId: string, timestamps: Iterable<string>): string {
 	const sorted = [...timestamps].sort();
 	return createHash("sha256").update([sessionId, ...sorted].join("\n")).digest("hex").slice(0, 16);
 }
 
-/**
- * Validate the consolidator's outcome report against the submitted batch: the batchId must
- * match, and every submitted timestamp must be accounted for exactly once — no missing, no
- * extras, no duplicates. Throws on any violation; returns the per-disposition counts.
- */
+/** Unknown/duplicate ids invalidate a report; omissions are returned without a disposition. */
 export function validateConsolidatorOutcomes(
 	result: ConsolidatorRunResult,
 	batchId: string,
 	submittedTimestamps: readonly string[],
-): { counts: { promoted: number; retained: number; discarded: number } } {
+): {
+	counts: { promoted: number; retained: number; discarded: number };
+	acknowledgedTimestamps: string[];
+	missingTimestamps: string[];
+} {
 	if (result.batchId !== batchId) {
 		throw new Error(`outcome batchId "${result.batchId}" does not match the submitted batch "${batchId}"`);
 	}
@@ -178,22 +136,14 @@ export function validateConsolidatorOutcomes(
 		seen.add(outcome.timestamp);
 		counts[outcome.disposition] += 1;
 	}
-	const missing = submittedTimestamps.filter((timestamp) => !seen.has(timestamp));
-	if (missing.length > 0) {
-		const shown = missing.slice(0, 3).join(", ");
-		throw new Error(`missing outcomes for ${missing.length} submitted timestamp(s): ${shown}${missing.length > 3 ? ", …" : ""}`);
-	}
-	return { counts };
+	return {
+		counts,
+		acknowledgedTimestamps: submittedTimestamps.filter((timestamp) => seen.has(timestamp)),
+		missingTimestamps: submittedTimestamps.filter((timestamp) => !seen.has(timestamp)),
+	};
 }
 
-/**
- * Build the consolidator's `-p` prompt from FRESH bank state (post-lock): current index +
- * current overview + the batch lines + the batch id. The overview is included verbatim so
- * the consolidator rewrites it in place (wholesale, undated — never a dated running
- * history). Nothing in the prompt or the bank carries dates; front matter is exactly
- * id/title/summary. The outcome-file contract is spelled out so the worker knows its run is
- * judged by report_consolidation_outcomes, not by its closing words.
- */
+/** Called under the project lock so the worker sees the current bank. */
 function buildConsolidatorPrompt(
 	projectDir: string,
 	cwd: string,
@@ -204,7 +154,7 @@ function buildConsolidatorPrompt(
 	const indexText = renderIndexFile(listTopics(projectDir, cwd));
 	const overviewText = readOverview(projectDir);
 	const overviewWords = Math.round((overviewTargetTokens * 3) / 4);
-	const obsLines = sortObservations(batch).map(observationToLine).join("\n");
+	const obsLines = batch.map((observation, index) => `${index + 1}  ${observation.content}`).join("\n");
 	return (
 		"You are folding the observations below into the durable topic files under your sandbox " +
 		"(.memory/project/). Front matter is exactly id/title/summary — no dates or timestamps " +
@@ -216,17 +166,16 @@ function buildConsolidatorPrompt(
 		"===== CURRENT OVERVIEW (.memory/project/OVERVIEW.md — undated current-state orientation) =====\n" +
 		`${overviewText ?? "(empty — no overview yet; start one)"}\n` +
 		"===== END OVERVIEW =====\n\n" +
-		"===== OBSERVATIONS TO CONSOLIDATE (each line is `<timestamp-id>  <content>`) =====\n" +
+		"===== OBSERVATIONS TO CONSOLIDATE (each line is `<index>  <content>`; indices are 1-based) =====\n" +
 		`${obsLines}\n` +
 		"===== END OBSERVATIONS =====\n\n" +
 		"Fold every observation above into topic files (create/merge/rewrite as needed). Then update " +
 		`.memory/project/OVERVIEW.md per your instructions — keep it under ~${overviewTargetTokens} tokens ` +
 		`(~${overviewWords} words), undated current-state orientation: no advice or next steps.\n\n` +
-		"Finally, you MUST call report_consolidation_outcomes with your batch id " +
-		`"${batchId}" and one outcome entry for EVERY observation timestamp listed above — each ` +
-		"exactly once, as promoted, retained, or discarded. An incomplete or duplicated report invalidates " +
-		"the whole run: the orchestrator keeps the entire batch active and retries, wasting this work. " +
-		"Finish with a one-sentence confirmation."
+		"Finally, call report_consolidation_outcomes with your batch id and an { index, disposition } " +
+		`entry for each of the ${batch.length} numbered observations. Use integer labels, not timestamps. ` +
+		"If the tool reports missing indices or errors, supply missing or corrected entries until it " +
+		"confirms completion; calls merge. Never invent outcomes for unprocessed observations."
 	);
 }
 
@@ -245,27 +194,15 @@ export function evaluateConsolidatorTrigger(pi: ExtensionAPI, runtime: Runtime, 
 	if (ctx.hasUI) {
 		ctx.ui?.notify(`om: consolidator started (${promote.length} obs, ~${poolTokens(promote).toLocaleString()} tok)`, "info");
 	}
-	// Deliberately NOT tracked in observerTasks: compaction waits only for in-flight observers,
-	// never the consolidator (design R5). The consolidatorInFlight flag enforces one-at-a-time
-	// in-process; the project lock (§4) enforces it cross-process. A busy lock makes the
-	// dispatch defer — consolidatorInFlight is reset in its finally either way, so a later
-	// trigger re-fires on the next tick once the other holder has released.
+	// Compaction waits only for observers, not background consolidation.
 	void dispatchConsolidator(pi, runtime, ctx, promote);
 }
 
-/**
- * What a dispatch did — the synchronous report an explicit flush needs (background callers
- * ignore it). "completed" = the worker ran and its outcomes validated; "deferred" = the
- * default single-try lock acquisition found the lock busy (background semantics); "lock-busy"
- * = an injected lock waiter (flush) exhausted its bounded wait; "all-screened" = every
- * observation looked secret, so the batch drained locally without a worker; "failed" = worker
- * error or invalid outcomes (the batch stays active and retryable).
- */
 export type ConsolidatorDispatchResult = {
-	outcome: "completed" | "deferred" | "lock-busy" | "all-screened" | "failed";
+	outcome: "completed" | "partial" | "deferred" | "lock-busy" | "all-screened" | "failed";
 	/** Archive path recorded in the om.observations.archived entry (relative to cwd), once archived. */
 	archivePath?: string;
-	/** Worker-validated dispositions for the submitted batch ("completed" only). */
+	/** Worker-validated dispositions for acknowledged observations ("completed"/"partial"). */
 	counts?: { promoted: number; retained: number; discarded: number };
 	/** Secret-screened observations: never submitted; drained as discarded. */
 	screened?: number;
@@ -280,20 +217,11 @@ export type ConsolidatorDispatchResult = {
 };
 
 export type DispatchConsolidatorOptions = {
-	/**
-	 * Lock acquisition strategy, injected so the flush path can wait without changing the
-	 * background behavior. Default: one non-blocking try — busy means silent defer (a later
-	 * threshold trigger re-fires). The flush path injects `waitForProjectLock` (bounded,
-	 * cancellable retry; busy means the explicit command reports and exits).
-	 */
-	acquireLock?: (projectDir: string, owner: ProjectLockOwner) => LockHandle | "busy" | Promise<LockHandle | "busy">;
+	/** Flush injects a cancellable waiter; background consolidation tries once. */
+	acquireLock?: (projectDir: string, owner: ProjectLockOwner, signal: AbortSignal) => LockHandle | "busy" | Promise<LockHandle | "busy">;
 };
 
-/**
- * Tombstone the given timestamps, intersected with what is still active on the branch, and
- * return how many actually drained. Never tombstones something already dropped, and never
- * something an observer committed during the run (those are not in the handed batch).
- */
+/** Re-fold before committing: observers may have added observations while the worker ran. */
 function tombstoneStillActive(pi: ExtensionAPI, ctx: TriggerCtx, timestamps: readonly string[]): number {
 	const branch = ctx.sessionManager.getBranch();
 	const stillActive = new Set(foldLedger(branch).activeObservations.map((o) => o.timestamp));
@@ -316,26 +244,15 @@ export async function dispatchConsolidator(
 	const controller = new AbortController();
 	runtime.consolidatorController = controller;
 	runtime.status.workerStart("consolidator", runId);
-	// Identity of the session that dispatched this run; re-checked before any ledger commit
-	// (§7d step 8). The archive entry below is written pre-spawn into the dispatching
-	// session's ledger — exactly the session it belongs to — so it needs no guard; only the
-	// post-spawn tombstone must not land in a replacement session's ledger.
 	const dispatchSessionId = runtime.sessionId;
-	// Kept outside the try so a failure result can still tell the caller where the batch was
-	// archived (archive-before-drain means the file survives a failed run — it is the retry).
 	let archiveRelPath: string | undefined;
-	// The lock owner handed to the (possibly injected) acquisition strategy.
 	const lockOwner: ProjectLockOwner = { pid: process.pid, sessionId: dispatchSessionId, runId };
 
 	try {
-		// ── Step 1: archive first, before anything is drained. ─────────────────────────
-		// Secret-looking observations are pulled out of BOTH the archive and the submitted
-		// batch (best-effort screen — credentials never go to a subprocess) and are accounted
-		// as immediately discarded: they drain with the batch after validation.
+		// Secrets must reach neither the archive nor the worker.
 		const { safe, screened } = screenSecrets(promote);
 		if (safe.length === 0) {
-			// Whole batch screened: nothing to archive or submit. Drain directly as discarded —
-			// no worker, no bank writes, so no lock is needed either.
+			// No bank writes, so no project lock is needed.
 			const drained = tombstoneStillActive(pi, ctx, screened.map((o) => o.timestamp));
 			debugLog("consolidator.batch-all-screened", { runId, drained });
 			runtime.status.workerDone(runId, drained);
@@ -346,7 +263,9 @@ export async function dispatchConsolidator(
 		const archivePath = join(runtime.archiveDir, `${batchId}.json`);
 		atomicWrite(archivePath, `${JSON.stringify({ batchId, observations: safe }, null, "\t")}\n`);
 		archiveRelPath = relative(ctx.cwd, archivePath) || archivePath;
-		const submittedTimestamps = safe.map((o) => o.timestamp);
+		// Use this exact order in both the prompt and the index manifest.
+		const batch = sortObservations(safe);
+		const submittedTimestamps = batch.map((o) => o.timestamp);
 		pi.appendEntry(OM_OBSERVATIONS_ARCHIVED, { batchId, path: archiveRelPath, timestamps: submittedTimestamps });
 		debugLog("consolidator.archive", {
 			runId,
@@ -356,41 +275,31 @@ export async function dispatchConsolidator(
 			screened: screened.length,
 		});
 
-		// ── Step 2: project lock before reading the bank or building the prompt. ────────
-		// Default (background): one non-blocking try — busy defers silently (no retry loop, no
-		// spawn; the batch stays active and retryable, a later threshold trigger re-fires, and
-		// the archive write above is idempotent by name). The flush path injects a bounded,
-		// cancellable waiter instead; for it, busy means the wait timed out — surfaced as
-		// "lock-busy" so the explicit command can report the holder and exit without spawning.
 		const lock = await (opts.acquireLock
-			? opts.acquireLock(runtime.projectDir, lockOwner)
+			? opts.acquireLock(runtime.projectDir, lockOwner, controller.signal)
 			: acquireProjectLock(runtime.projectDir, lockOwner));
+		if (lock !== "busy") runtime.consolidatorLock = lock;
+		controller.signal.throwIfAborted();
 		if (lock === "busy") {
 			const lockMessage = inspectProjectLock(runtime.projectDir)?.message ?? "held by another process";
 			debugLog("consolidator.lock.busy", { runId, batchId, flush: opts.acquireLock !== undefined, lockMessage });
-			if (!opts.acquireLock) {
-				// Background dispatch defers (info-level notice at most).
-				if (ctx.hasUI) {
-					ctx.ui?.notify("om: consolidation deferred — the project memory lock is held by another process", "info");
-				}
-				runtime.status.workerDone(runId, 0);
-				return { outcome: "deferred", archivePath: archiveRelPath, lockMessage };
+			if (!opts.acquireLock && ctx.hasUI) {
+				ctx.ui?.notify("om: consolidation deferred — the project memory lock is held by another process", "info");
 			}
 			runtime.status.workerDone(runId, 0);
-			return { outcome: "lock-busy", archivePath: archiveRelPath, lockMessage };
+			return { outcome: opts.acquireLock ? "lock-busy" : "deferred", archivePath: archiveRelPath, lockMessage };
 		}
-		runtime.consolidatorLock = lock;
 
-		// ── Step 3: build the prompt from FRESH bank state (post-lock). ────────────────
 		const prompt = buildConsolidatorPrompt(
 			runtime.projectDir,
 			ctx.cwd,
-			safe,
+			batch,
 			batchId,
 			runtime.config.overviewTargetTokens,
 		);
 
-		// ── Step 4: spawn with the split env including the batch id. ──────────────────
+		const batchPath = consolidatorBatchPath(runtime.runtimeDir, runId);
+		writeConsolidatorBatch(batchPath, { batchId, timestamps: submittedTimestamps });
 		const argv = buildWorkerArgv({
 			model: runtime.config.models.consolidator,
 			sessionName: `om-consolidator-${runId}`,
@@ -400,47 +309,43 @@ export async function dispatchConsolidator(
 			runtimeDir: runtime.runtimeDir,
 			projectDir: runtime.projectDir,
 			runId,
-			batchId,
+			batchPath,
 		});
 		const exit = await spawnWorker({ argv, cwd: runtime.runtimeDir, env, signal: controller.signal });
 		// Capture cost before the exit-code check so a partial run's spend is still recorded.
 		recordWorkerCost(pi, runtime, ctx, "consolidator", runId);
+		// Crashes and cancellations are not acknowledgements, even if a report exists.
+		controller.signal.throwIfAborted();
 		if (exit.code !== 0) {
 			throw new Error(`consolidator exited with code ${exit.code}${exit.stderr ? `: ${exit.stderr.trim().slice(0, 200)}` : ""}`);
 		}
 
-		// ── Step 5: validate the outcome contract. ─────────────────────────────────────
-		// Exit code 0 alone is NOT success: the file must exist, parse, match the batch id,
-		// and account for every submitted timestamp exactly once. Any violation leaves the
-		// whole batch active (retryable — no tombstone).
-		let counts: { promoted: number; retained: number; discarded: number };
+		// Revalidate persisted ids; the worker's exit code alone is not success.
+		let validation: ReturnType<typeof validateConsolidatorOutcomes>;
 		try {
 			const result = readConsolidatorResult(consolidatorResultPath(runtime.runtimeDir, runId));
-			counts = validateConsolidatorOutcomes(result, batchId, submittedTimestamps).counts;
+			validation = validateConsolidatorOutcomes(result, batchId, submittedTimestamps);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			debugLog("consolidator.outcomes.invalid", { runId, batchId, message });
 			throw new Error(`consolidator outcome validation failed: ${message}`);
 		}
 
-		// ── Steps 6 + 8: INDEX first, tombstone last — the acknowledgement (tombstone) lands
-		// only after successful publication AND index generation (the proposal's explicit
-		// ordering). INDEX regeneration is a project-scoped bank write — it belongs to the run
-		// even when the session identity changes. Index → tombstone stay one critical section
-		// under the lock: a crash between them leaves the batch active and retryable (the
-		// batch-id replay merges); the reverse order would drain the batch with a stale index.
+		const { counts, acknowledgedTimestamps, missingTimestamps } = validation;
+		if (missingTimestamps.length > 0) {
+			debugLog("consolidator.outcomes.partial", {
+				runId, batchId, acknowledged: acknowledgedTimestamps.length, missing: missingTimestamps,
+			});
+		}
+
+		// Publish INDEX before acknowledging anything; a failure must leave the batch retryable.
 		atomicWrite(indexPath(runtime.projectDir), renderIndexFile(listTopics(runtime.projectDir, ctx.cwd)));
 		debugLog("consolidator.index", { runId, batchId });
 
-		// Tombstone — and only into the dispatching session's ledger.
 		let drained = 0;
 		let tombstoneSkipped = false;
 		if (ctx.sessionManager.getSessionId() !== dispatchSessionId) {
-			// The session was replaced while the worker ran (resume into a new session,
-			// session_start with a different id). Appending the tombstone now would drain the
-			// batch in a ledger the observations do not belong to. Bank writes are
-			// project-scoped and stand; only the ledger writes are discarded. The batch
-			// stays active on THIS branch, which is the correct, conservative outcome.
+			// Bank writes are shared, but acknowledgements belong only to the originating session.
 			debugLog("consolidator.session-mismatch", {
 				runId,
 				batchId,
@@ -452,8 +357,7 @@ export async function dispatchConsolidator(
 			}
 			tombstoneSkipped = true;
 		} else {
-			// Submitted + secret-screened (never submitted, but they must drain too).
-			drained = tombstoneStillActive(pi, ctx, [...safe, ...screened].map((o) => o.timestamp));
+			drained = tombstoneStillActive(pi, ctx, [...acknowledgedTimestamps, ...screened.map((o) => o.timestamp)]);
 			debugLog("consolidator.tombstone", {
 				runId,
 				batchId,
@@ -469,12 +373,16 @@ export async function dispatchConsolidator(
 		runtime.refreshFooterGauges(ctx.sessionManager.getBranch(), ctx.getContextUsage?.());
 		if (ctx.hasUI && ctx.ui) {
 			runtime.queueToast(
-				`om: consolidator promoted ${counts.promoted}, retained ${counts.retained}, discarded ${counts.discarded + screened.length}`,
-				"info",
+				`om: consolidator promoted ${counts.promoted}, retained in archive ${counts.retained}, discarded ${counts.discarded + screened.length}` +
+					(missingTimestamps.length > 0 ? `; ${missingTimestamps.length} unreported observation(s) remain active` : ""),
+				missingTimestamps.length > 0 ? "warning" : "info",
 				ctx.ui.notify.bind(ctx.ui),
 			);
 		}
-		return { outcome: "completed", archivePath: archiveRelPath, counts, screened: screened.length, drained, tombstoneSkipped };
+		return {
+			outcome: missingTimestamps.length > 0 ? "partial" : "completed",
+			archivePath: archiveRelPath, counts, screened: screened.length, drained, tombstoneSkipped,
+		};
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		runtime.lastWorkerError = message;
@@ -482,11 +390,7 @@ export async function dispatchConsolidator(
 		if (ctx.hasUI) ctx.ui?.notify(`om: consolidator failed: ${message}`, "error");
 		return { outcome: "failed", archivePath: archiveRelPath, error: message };
 	} finally {
-		// Step 7: release the lock after the worker has exited. This finally is the ONLY
-		// release site: abortAllWorkers() (/om off, session replacement, shutdown) aborts the
-		// worker but deliberately leaves the release to run here, after the worker's close
-		// event — the lock is never freed while a worker we spawned may still write.
-		// releaseProjectLock itself is owner-checked and never throws.
+		// Abort requests do not release the lock: the worker must exit before another writer starts.
 		runtime.releaseConsolidatorLock();
 		runtime.consolidatorController = undefined;
 		runtime.consolidatorInFlight = false;

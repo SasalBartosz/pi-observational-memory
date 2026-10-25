@@ -40,7 +40,7 @@ project-identity layer). Three roots with different lifetimes:
 │                                   plus .consolidation.lock (transient lock file)
 ├── sessions/<sessionId>/archive/   per-session archives of consolidator batches,
 │                                   written verbatim before draining (persistent)
-└── runtime/<sessionId>/runs/       transient worker IPC (result/cost files) — safe to
+└── runtime/<sessionId>/runs/       transient worker IPC (manifest/result/cost files) — safe to
                                     clean periodically, never while workers are live
 ```
 
@@ -100,16 +100,22 @@ flowchart LR
      subprocess.
   2. **Acquire the project lock** before reading the bank or building the prompt.
   3. Build the prompt from **fresh post-lock bank state** (current index + OVERVIEW + batch).
-  4. Spawn the worker; it edits topic files and OVERVIEW.md via sandboxed tools and ends by
-     calling `report_consolidation_outcomes`.
-  5. **Validate the outcome contract**: the report must match the batch id and account for
-     every submitted timestamp exactly once. Worker exit code 0 alone is *not* success; a
-     missing or invalid report leaves the whole batch active and retryable (no tombstone).
+  4. Number the observations `1..N` and write a per-run index-to-timestamp manifest outside
+     the bank. The worker edits topic files and OVERVIEW.md via sandboxed tools, then calls
+     `report_consolidation_outcomes` with `{ index, disposition }` entries — no timestamp
+     transcription. The tool validates against the manifest, merges repeated calls, and
+     returns precise missing indices so the worker can repair an incomplete report in place.
+  5. **Validate the outcome contract again after a clean worker exit**: every reported
+     timestamp must belong to the batch and occur exactly once. A missing result file,
+     wrong batch id, malformed entry, unknown id, or duplicate invalidates the run. A valid
+     but incomplete report makes **partial progress**: only explicitly reported observations
+     are acknowledged; unreported observations stay active without a default disposition.
+     A worker crash/abort still leaves the entire submitted batch active and retryable.
   6. **Regenerate INDEX.md under the same lock, then tombstone last** — the acknowledgement
      lands only after validation *and* successful index generation, and only for
-     observations still active on the originating branch. A crash between the index write
-     and the tombstone leaves the batch active and retryable (the replay merges by batch
-     id); a failed index write means no tombstone at all.
+     acknowledged observations still active on the originating branch. A crash between the
+     index write and the tombstone leaves the batch active and retryable (the replay merges
+     by batch id); a failed index write means no tombstone at all.
 - **Promotion policy** (the consolidator's core rule): promote only *established current
   state, confirmed constraints, explicitly accepted decisions, durable conventions, and
   verified workarounds* — and only when the observations carry evidence for it. Speculation,
@@ -146,17 +152,22 @@ clutter the project's `/resume` picker.
 ## Short sessions: flush before you leave
 
 Thresholds may never fire in a short session. **Run `/om:consolidate --flush` before ending
-it** — it is the only guaranteed publish. The full pipeline, awaited synchronously:
+it** to explicitly publish established knowledge. The full pipeline, awaited synchronously:
 
 1. One observer over the remaining uncovered conversation, even below `chunkTokens`;
 2. Full-pool consolidation — *all* active observations, no overflow selection;
 3. A bounded wait for the project lock (up to 60 s; on timeout it reports the holder and
-   exits without spawning).
+   exits without spawning);
+4. If a clean worker exit leaves a valid partial report, retry **only the unreported,
+   still-active subset**, up to three total consolidation attempts and only while progress
+   is made. Newly observed items are not pulled into these retries.
 
-The final report carries promoted / retained / discarded counts plus the archive path, so
-you know it is safe to leave. There is no automatic idle-time flush (a possible later
-opt-in), and shutdown-time model calls are explicitly *not* relied upon — nothing runs at
-exit.
+The completion report aggregates promoted / retained / discarded counts and includes the
+original batch's archive path. `retained` means preserved in that session archive, **not** kept in the
+active pool or shared with future sessions. Only a completed flush with no active observations
+says it is safe to leave; an incomplete flush reports the remaining items and can be retried.
+There is no automatic idle-time flush, and shutdown-time model calls are explicitly *not*
+relied upon — nothing runs at exit.
 
 ## Concurrency: the project lock
 

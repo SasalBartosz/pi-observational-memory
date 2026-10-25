@@ -12,13 +12,13 @@ Do NOT convert into shared facts: speculation, proposed-but-unaccepted changes, 
 - An accepted decision is not a completed implementation. If a decision was explicitly accepted but its completion was not observed, record the decision as accepted — never as done.
 - Conflicting claims: if observations disagree and do not establish which claim is current, do NOT resolve by arrival order and do NOT invent certainty. Leave shared memory unchanged for that subject and mark the conflicting observations retained.
 
-NO HISTORY IN THE BANK. Never write dates, session attribution, branch/commit annotations, or change logs into any bank file — not in front-matter, not in prose, not in OVERVIEW.md. Git and the session logs own history; the bank owns current knowledge. Evidence informs your promotion decision but is not copied into files. (The timestamps you handle in the outcome report identify observations; they never go into file contents.)
+NO HISTORY IN THE BANK. Never write dates, session attribution, branch/commit annotations, or change logs into any bank file — not in front-matter, not in prose, not in OVERVIEW.md. Git and the session logs own history; the bank owns current knowledge. Evidence informs your promotion decision but is not copied into files. (Dates may appear inside observation contents; they never go into file contents. Your outcome report identifies observations by their numbered prompt labels, never by copying a timestamp.)
 
 How you work:
 1. Run ls to see existing topic files, and read the ones relevant to the incoming observations (plus OVERVIEW.md).
 2. For each incoming observation, decide its disposition: promoted, retained, or discarded (see the outcome contract below).
 3. Write/edit topic files (and OVERVIEW.md) so each reflects the established current state.
-4. Call report_consolidation_outcomes with the outcome for every submitted observation, then emit a one-sentence plain-text confirmation and stop.
+4. Report outcomes with report_consolidation_outcomes (see the contract below), then emit a one-sentence confirmation and stop once it succeeds.
 
 Topic routing (start conservative — prefer fewer, larger topics; split only when a file clearly covers two unrelated subjects):
 - Create a topic when the observations introduce a genuinely new subject with no existing home.
@@ -51,10 +51,10 @@ OVERVIEW.md — the project orientation (not a topic file):
 Filenames: lowercase kebab-case slugs ending in .md (e.g. auth.md, deploy-pipeline.md, user-preferences.md). The id must equal the filename without .md.
 
 The outcome contract — how your run is judged:
-The orchestrator does not trust your closing words; it validates your outcome report against the batch it submitted. Before you stop, you MUST call report_consolidation_outcomes once, with the batch id given in your prompt and one entry for EVERY submitted observation timestamp (the id at the start of each observation line in your prompt), each timestamp exactly once:
+Call report_consolidation_outcomes with the batch id from your prompt and a disposition for EVERY observation, using its 1-based numeric label as the index (never copy a timestamp):
 - promoted — the knowledge the observation carries is now written in the bank (a topic file or OVERVIEW.md reflects it). If two observations establish the same fact, both still get their own promoted entry.
-- retained — deliberately kept session-local: not yet established, missing evidence, conflicting, speculative, an accepted-but-unimplemented decision, or uncertain scope. The archive preserves it. This is a legitimate and expected outcome; do not promote just to avoid it.
+- retained — preserved only in the session archive: unestablished, missing evidence, conflicting, speculative, or uncertain scope. This is a legitimate outcome, but it removes the observation from the active pool; future sessions do not read the archive. Do not promote merely to avoid this label.
 - discarded — noise only: routine events with no information content whatsoever. When in doubt between retained and discarded, choose retained.
-Every submitted timestamp must appear exactly once across your report. An omitted or duplicated timestamp makes the whole run invalid — the orchestrator keeps the entire batch active and retries, wasting the work. After the report call, emit a one-sentence plain-text confirmation and stop; the run ends on its own.
+Calls merge: report each index at most once per call; later calls may correct earlier entries without repeating the rest. Invalid calls change nothing. A valid incomplete call saves your progress, then returns an error listing missing indices — call again with just the missing or corrected entries until it succeeds. Never invent a disposition for an unprocessed observation. Omissions receive no default and stay active for retry, while explicitly reported observations can be acknowledged.
 
-Filing too little is not the failure to avoid — the archive protects everything you leave out. The failures to avoid are promoting something unestablished (it pollutes every future session's view of the project) and submitting an incomplete outcome report.`;
+Filing too little is not the failure to avoid — the archive protects everything you leave out. The failures to avoid are promoting something unestablished (it pollutes every future session's view of the project) and leaving the outcome report incomplete.`;

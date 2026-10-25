@@ -12,23 +12,41 @@ vi.mock("../src/spawn/launch.js", async (importOriginal) => {
 });
 
 import { DEFAULTS } from "../src/config.js";
-import { registerConsolidateCommand } from "../src/commands/consolidate.js";
+import { MAX_FLUSH_CONSOLIDATION_ATTEMPTS, registerConsolidateCommand } from "../src/commands/consolidate.js";
 import { dispatchConsolidator, waitForProjectLock } from "../src/hooks/consolidator-trigger.js";
 import { flushObserverTail } from "../src/hooks/observer-trigger.js";
 import { foldLedger, type Entry } from "../src/ledger/index.js";
 import { acquireProjectLock, inspectProjectLock, releaseProjectLock } from "../src/memory/lock.js";
 import { Runtime } from "../src/runtime.js";
 import { spawnWorker } from "../src/spawn/launch.js";
-import { writeConsolidatorResult, writeObserverResult, type ConsolidatorOutcome } from "../src/spawn/runs.js";
+import {
+	readConsolidatorBatch,
+	writeConsolidatorResult,
+	writeObserverResult,
+	type ConsolidatorOutcome,
+} from "../src/spawn/runs.js";
 import { observation, observationsRecordedEntry, rawMessage, type TestObservation } from "./fixtures/session.js";
 
 const spawnMock = vi.mocked(spawnWorker);
 
-/** Observation lines inside the consolidator kickoff prompt: "<timestamp>  <content>". */
-function parseBatchTimestamps(argv: string[]): string[] {
+/** The authoritative batch manifest the dispatcher hands the consolidator env. */
+function batchManifest(env: NodeJS.ProcessEnv) {
+	const path = env.OM_BATCH_PATH;
+	if (!path) throw new Error("consolidator env is missing OM_BATCH_PATH");
+	return readConsolidatorBatch(path);
+}
+
+/** 1-based observation indices from the consolidator prompt's observations section. */
+function parseBatchIndices(argv: string[]): number[] {
 	const prompt = argv[argv.indexOf("-p") + 1] ?? "";
-	const section = prompt.split("OBSERVATIONS TO CONSOLIDATE")[1] ?? "";
-	return [...section.matchAll(/^(\S+) {2}/gm)].map((match) => match[1] ?? "");
+	const section = (prompt.split("OBSERVATIONS TO CONSOLIDATE")[1] ?? "").split("END OBSERVATIONS")[0] ?? "";
+	return [...section.matchAll(/^(\d+) {2}/gm)].map((match) => Number(match[1]));
+}
+
+/** The timestamps the given consolidator spawn actually submitted (manifest + prompt indices). */
+function submittedTimestamps(call: any[]): string[] {
+	const manifest = batchManifest(call[0].env);
+	return parseBatchIndices(call[0].argv).map((index) => manifest.timestamps[index - 1]!);
 }
 
 const DEFAULT_OBSERVATIONS = (): TestObservation[] => [
@@ -133,10 +151,15 @@ const allPromoted = (timestamps: string[]): ConsolidatorOutcome[] =>
 	timestamps.map((timestamp) => ({ timestamp, disposition: "promoted" as const }));
 
 /** Fake worker behavior for both roles: observer emits one tail observation, consolidator reports outcomes. */
-function defaultFakeWorker(opts: {
-	/** Dispositions for the consolidator by submitted timestamp; defaults to all promoted. */
-	outcomes?: (timestamps: string[]) => ConsolidatorOutcome[];
-} = {}): void {
+function defaultFakeWorker(
+	opts: {
+		/** Dispositions for the consolidator by submitted timestamp; defaults to all promoted. */
+		outcomes?: (timestamps: string[], attempt: number) => ConsolidatorOutcome[];
+		/** Side effect per consolidator spawn (session switch, mid-run observation commit, …). */
+		onConsolidator?: (attempt: number) => void;
+	} = {},
+): void {
+	let attempt = 0;
 	spawnMock.mockImplementation(async (o) => {
 		if (o.env.OM_WORKER === "observer") {
 			writeObserverResult(o.env.OM_RESULT_PATH ?? "", {
@@ -144,10 +167,14 @@ function defaultFakeWorker(opts: {
 			});
 			return { code: 0, signal: null, stderr: "" };
 		}
-		const timestamps = parseBatchTimestamps(o.argv);
+		attempt += 1;
+		opts.onConsolidator?.(attempt);
+		// The manifest is authoritative: the prompt lists 1-based indices, never timestamps.
+		const manifest = batchManifest(o.env);
+		const timestamps = parseBatchIndices(o.argv).map((index) => manifest.timestamps[index - 1]!);
 		writeConsolidatorResult(o.env.OM_RESULT_PATH ?? "", {
-			batchId: o.env.OM_BATCH_ID ?? "",
-			outcomes: (opts.outcomes ?? allPromoted)(timestamps),
+			batchId: manifest.batchId,
+			outcomes: (opts.outcomes ?? allPromoted)(timestamps, attempt),
 		});
 		return { code: 0, signal: null, stderr: "" };
 	});
@@ -239,7 +266,7 @@ describe("/om:consolidate --flush (full pipeline)", () => {
 		expect(observerCalls()).toHaveLength(1);
 		const cons = consolidatorCalls();
 		expect(cons).toHaveLength(1);
-		const submitted = parseBatchTimestamps(cons[0]![0].argv);
+		const submitted = submittedTimestamps(cons[0]!);
 		expect([...submitted].sort()).toEqual([
 			"2026-05-02T10:00:01",
 			"2026-05-02T10:00:02",
@@ -271,11 +298,46 @@ describe("/om:consolidate --flush (full pipeline)", () => {
 		const report = h.notifications.map((n) => n.message).find((m) => m.includes("flush complete"));
 		expect(report).toBeDefined();
 		expect(report).toContain("promoted 1");
-		expect(report).toContain("retained locally 1");
+		expect(report).toContain("retained in archive 1");
 		expect(report).toContain("discarded 1");
 		expect(report).toMatch(/archive: \.memory[/\\]sessions[/\\]sess-1[/\\]archive[/\\][0-9a-f]{16}\.json/);
 		expect(report).toContain("Safe to leave");
 		expect(foldLedger(h.branch).activeObservations).toHaveLength(0);
+	});
+
+	it("an empty pool reports nothing to consolidate and spawns no worker", async () => {
+		const h = makeHarness({ observations: [], coversUpToId: "raw-2" });
+		spawnMock.mockImplementation(async (opts) => {
+			writeObserverResult(opts.env.OM_RESULT_PATH!, { observations: [] });
+			return { code: 0, signal: null, stderr: "" };
+		});
+
+		await h.handler("--flush");
+
+		expect(consolidatorCalls()).toHaveLength(0);
+		const report = h.notifications.at(-1)!;
+		expect(report.level).toBe("info");
+		expect(report.message).toBe("om: flush complete — nothing to consolidate");
+	});
+
+	it("a fully secret-screened pool drains locally, reports discarded, and spawns no worker", async () => {
+		const h = makeHarness({
+			coversUpToId: "raw-2",
+			observations: [
+				observation("2026-05-02T10:00:01", { content: "password=hunter2secretvalue" }),
+				observation("2026-05-02T10:00:02", { content: "token=abcdefghijklmnopqrstuvwxyz" }),
+				observation("2026-05-02T10:00:03", { content: "secret=zyxwvutsrqponmlkjihgfedcba" }),
+			],
+		});
+		defaultFakeWorker();
+
+		await h.handler("--flush");
+
+		expect(consolidatorCalls()).toHaveLength(0);
+		expect(foldLedger(h.branch).activeObservations).toHaveLength(0);
+		const report = h.notifications.map((n) => n.message).find((m) => m.includes("flush complete"));
+		expect(report).toContain("discarded 3");
+		expect(report).toContain("Safe to leave");
 	});
 
 	it("lock busy → the flush waits (bounded retry) and runs once the lock is released mid-wait", async () => {
@@ -359,7 +421,7 @@ describe("/om:consolidate without --flush (explicit overflow-only)", () => {
 
 		await vi.waitFor(() => expect(h.runtime.consolidatorInFlight).toBe(false));
 		expect(consolidatorCalls()).toHaveLength(1);
-		const submitted = parseBatchTimestamps(consolidatorCalls()[0]![0].argv);
+		const submitted = submittedTimestamps(consolidatorCalls()[0]!);
 		expect(submitted).toEqual(["2026-05-02T10:00:01", "2026-05-02T10:00:02"]);
 		// The newest observation stays in the local buffer.
 		expect(foldLedger(h.branch).activeObservations.map((o) => o.timestamp)).toEqual(["2026-05-02T10:00:03"]);
@@ -415,5 +477,343 @@ describe("dispatchConsolidator with an injected lock waiter", () => {
 		expect(result.outcome).toBe("completed");
 		expect(consolidatorCalls()).toHaveLength(1);
 		expect(foldLedger(h.branch).activeObservations).toHaveLength(0);
+	});
+});
+
+describe("/om:consolidate --flush partial outcomes (bounded retries)", () => {
+	it("re-dispatches only the unreported subset, aggregates counts, and completes", async () => {
+		const h = makeHarness({ coversUpToId: "raw-2" });
+		defaultFakeWorker({
+			outcomes: (timestamps, attempt) => {
+				if (attempt === 1) {
+					return timestamps.slice(0, -1).map((timestamp, i) => ({
+						timestamp,
+						disposition: (i === 0 ? "promoted" : "retained") as ConsolidatorOutcome["disposition"],
+					}));
+				}
+				return timestamps.map((timestamp) => ({ timestamp, disposition: "discarded" as const }));
+			},
+		});
+
+		await h.handler("--flush");
+
+		const cons = consolidatorCalls();
+		expect(cons).toHaveLength(2);
+		expect([...submittedTimestamps(cons[0]!)].sort()).toEqual([
+			"2026-05-02T10:00:01",
+			"2026-05-02T10:00:02",
+			"2026-05-02T10:00:03",
+		]);
+		expect(submittedTimestamps(cons[1]!)).toEqual(["2026-05-02T10:00:03"]);
+
+		expect(foldLedger(h.branch).activeObservations).toHaveLength(0);
+		const report = h.notifications.at(-1)?.message ?? "";
+		expect(report).toContain("flush complete");
+		expect(report).toContain("promoted 1");
+		expect(report).toContain("retained in archive 1");
+		expect(report).toContain("discarded 1");
+		expect(report).toContain("Safe to leave");
+		expect(h.runtime.consolidatorInFlight).toBe(false);
+	});
+
+	it("stops after a repeated no-progress partial and leaves the omitted observation active", async () => {
+		const h = makeHarness({ coversUpToId: "raw-2" });
+		// Always omit the final submitted timestamp: attempt 1 makes progress, attempt 2 (only
+		// the omitted timestamp) acknowledges nothing and must not be retried again.
+		defaultFakeWorker({ outcomes: (timestamps) => allPromoted(timestamps.slice(0, -1)) });
+
+		await h.handler("--flush");
+
+		expect(consolidatorCalls()).toHaveLength(2);
+		expect(foldLedger(h.branch).activeObservations.map((o) => o.timestamp)).toEqual(["2026-05-02T10:00:03"]);
+		const report = h.notifications.at(-1)?.message ?? "";
+		expect(report).toContain("flush incomplete");
+		expect(report).toContain("1 observation(s) remain active");
+		expect(report).not.toContain("Safe to leave");
+	});
+
+	it("caps retries at MAX_FLUSH_CONSOLIDATION_ATTEMPTS and reports the remainder active", async () => {
+		const h = makeHarness({
+			coversUpToId: "raw-2",
+			observations: [
+				observation("2026-05-02T10:00:01"),
+				observation("2026-05-02T10:00:02"),
+				observation("2026-05-02T10:00:03"),
+				observation("2026-05-02T10:00:04"),
+			],
+		});
+		// Acknowledge exactly one per attempt: forward progress every time, never completion.
+		defaultFakeWorker({ outcomes: (timestamps) => allPromoted(timestamps.slice(0, 1)) });
+
+		await h.handler("--flush");
+
+		expect(consolidatorCalls()).toHaveLength(MAX_FLUSH_CONSOLIDATION_ATTEMPTS);
+		expect(foldLedger(h.branch).activeObservations).toHaveLength(1);
+		const report = h.notifications.at(-1)?.message ?? "";
+		expect(report).toContain("flush incomplete");
+		expect(report).not.toContain("Safe to leave");
+	});
+
+	it("a session switch mid-run is reported incomplete, never as safe to leave", async () => {
+		const h = makeHarness({ coversUpToId: "raw-2" });
+		defaultFakeWorker({
+			onConsolidator: () => {
+				h.ctx.sessionManager.getSessionId = () => "sess-2";
+			},
+		});
+
+		await h.handler("--flush");
+
+		expect(consolidatorCalls()).toHaveLength(1);
+		// The tombstone was skipped: the batch stays active on the dispatching branch.
+		expect(foldLedger(h.branch).activeObservations).toHaveLength(3);
+		const report = h.notifications.at(-1)?.message ?? "";
+		expect(report).toContain("flush incomplete");
+		expect(report).toContain("session was replaced");
+		expect(report).not.toContain("Safe to leave");
+	});
+
+	it("still errors on an outcome for an unknown timestamp, leaving the batch active", async () => {
+		const h = makeHarness({ coversUpToId: "raw-2" });
+		defaultFakeWorker({
+			outcomes: (timestamps) => [
+				...allPromoted(timestamps),
+				{ timestamp: "1999-01-01T00:00:00", disposition: "promoted" },
+			],
+		});
+
+		await h.handler("--flush");
+
+		expect(consolidatorCalls()).toHaveLength(1); // failed → no retry
+		expect(foldLedger(h.branch).activeObservations).toHaveLength(3);
+		const report = h.notifications.at(-1)?.message ?? "";
+		expect(report).toContain("flush failed");
+		expect(report).not.toContain("Safe to leave");
+	});
+
+	it("does not swallow an observation committed mid-run: reports incomplete while it is active", async () => {
+		const h = makeHarness({ coversUpToId: "raw-2" });
+		defaultFakeWorker({
+			onConsolidator: () => {
+				// An observer commits a brand-new active observation while the consolidator runs.
+				h.branch.push(
+					observationsRecordedEntry("mid-run-commit", {
+						observations: [observation("2026-05-02T10:09:00")],
+						coversUpToId: "raw-2",
+					}),
+				);
+			},
+		});
+
+		await h.handler("--flush");
+
+		// The originally selected three drained; the mid-run observation was never submitted.
+		expect(foldLedger(h.branch).activeObservations.map((o) => o.timestamp)).toEqual(["2026-05-02T10:09:00"]);
+		const report = h.notifications.at(-1)?.message ?? "";
+		expect(report).toContain("flush incomplete");
+		expect(report).not.toContain("Safe to leave");
+	});
+
+	it("keeps a mid-run observation out of partial retries but still reports incomplete", async () => {
+		const h = makeHarness({ coversUpToId: "raw-2" });
+		defaultFakeWorker({
+			outcomes: (timestamps, attempt) => allPromoted(attempt === 1 ? timestamps.slice(0, 1) : timestamps),
+			onConsolidator: (n) => {
+				if (n !== 1) return;
+				h.branch.push(
+					observationsRecordedEntry("mid-run-commit", {
+						observations: [observation("2026-05-02T10:09:00")],
+						coversUpToId: "raw-2",
+					}),
+				);
+			},
+		});
+
+		await h.handler("--flush");
+
+		const cons = consolidatorCalls();
+		expect(cons).toHaveLength(2);
+		expect(submittedTimestamps(cons[1]!)).toEqual(["2026-05-02T10:00:02", "2026-05-02T10:00:03"]);
+		expect(foldLedger(h.branch).activeObservations.map((o) => o.timestamp)).toEqual(["2026-05-02T10:09:00"]);
+		const report = h.notifications.at(-1)!.message;
+		expect(report).toContain("flush incomplete");
+		expect(report).not.toContain("Safe to leave");
+	});
+});
+
+describe("/om:consolidate --flush abort and post-progress failures", () => {
+	it("a session switch during tail observation does not report an empty replacement session as complete", async () => {
+		const h = makeHarness();
+		defaultFakeWorker();
+		spawnMock.mockImplementationOnce(async (opts) => {
+			expect(opts.env.OM_WORKER).toBe("observer");
+			writeObserverResult(opts.env.OM_RESULT_PATH!, { observations: [] });
+			h.ctx.sessionManager.getSessionId = () => "sess-2";
+			h.ctx.sessionManager.getBranch = () => [];
+			return { code: 0, signal: null, stderr: "" };
+		});
+
+		await h.handler("--flush");
+
+		expect(observerCalls()).toHaveLength(1);
+		expect(consolidatorCalls()).toHaveLength(0);
+		expect(foldLedger(h.branch).activeObservations).toHaveLength(3);
+		expect(h.notifications.at(-1)?.message).toContain("session was replaced");
+		expect(h.notifications.at(-1)?.message).not.toContain("flush complete");
+	});
+
+	it("a partial report plus a session switch into an empty new branch stops at the first run", async () => {
+		const h = makeHarness({ coversUpToId: "raw-2" });
+		const dispatchingBranch = h.branch;
+		defaultFakeWorker({
+			outcomes: (timestamps) => allPromoted(timestamps.slice(0, -1)),
+			onConsolidator: () => {
+				h.ctx.sessionManager.getSessionId = () => "sess-2";
+				h.ctx.sessionManager.getBranch = () => [];
+			},
+		});
+
+		await h.handler("--flush");
+
+		expect(consolidatorCalls()).toHaveLength(1);
+		expect(foldLedger(dispatchingBranch).activeObservations).toHaveLength(3);
+		const report = h.notifications.at(-1)!;
+		expect(report.level).toBe("warning");
+		expect(report.message).toContain("flush incomplete");
+		expect(report.message).toContain("session was replaced");
+		expect(report.message).toContain("0 observation(s) remain active in the new session");
+		// The bank writes stand even though the tombstone was skipped, so they are counted.
+		expect(report.message).toContain("promoted 2");
+		expect(report.message).not.toContain("Safe to leave");
+	});
+
+	it("an abort before the first worker spawns no consolidator at all", async () => {
+		const h = makeHarness({ coversUpToId: "raw-2" });
+		const controller = new AbortController();
+		controller.abort();
+		h.ctx.signal = controller.signal;
+		defaultFakeWorker();
+
+		await h.handler("--flush");
+
+		expect(consolidatorCalls()).toHaveLength(0);
+		expect(foldLedger(h.branch).activeObservations).toHaveLength(3);
+		const report = h.notifications.at(-1)!;
+		expect(report.message).toContain("flush aborted");
+		expect(report.message).not.toContain("Safe to leave");
+	});
+
+	it("an abort after a partial made progress stops further dispatch and reports the remainder active", async () => {
+		const h = makeHarness({ coversUpToId: "raw-2" });
+		const controller = new AbortController();
+		h.ctx.signal = controller.signal;
+		defaultFakeWorker({
+			outcomes: (timestamps) => allPromoted(timestamps.slice(0, -1)),
+			onConsolidator: () => controller.abort(),
+		});
+
+		await h.handler("--flush");
+
+		expect(consolidatorCalls()).toHaveLength(1);
+		expect(foldLedger(h.branch).activeObservations.map((o) => o.timestamp)).toEqual(["2026-05-02T10:00:03"]);
+		const report = h.notifications.at(-1)!;
+		expect(report.message).toContain("flush aborted");
+		expect(report.message).toContain("1 observation(s) remain active");
+		expect(report.message).not.toContain("Safe to leave");
+	});
+
+	it("an invalid duplicate report after partial progress retains the unreported subset", async () => {
+		const h = makeHarness({ coversUpToId: "raw-2" });
+		defaultFakeWorker({
+			outcomes: (timestamps, attempt) => {
+				if (attempt === 1) return allPromoted(timestamps.slice(0, -1));
+				return [
+					{ timestamp: timestamps[0]!, disposition: "promoted" },
+					{ timestamp: timestamps[0]!, disposition: "discarded" },
+				];
+			},
+		});
+
+		await h.handler("--flush");
+
+		expect(consolidatorCalls()).toHaveLength(2);
+		expect(foldLedger(h.branch).activeObservations.map((o) => o.timestamp)).toEqual(["2026-05-02T10:00:03"]);
+		const report = h.notifications.at(-1)!;
+		expect(report.message).toContain("flush failed");
+		expect(report.message).toContain("1 observation(s) remain active");
+		expect(report.message).not.toContain("Safe to leave");
+	});
+
+	it("/om off after a partial made progress stops retries and reports aborted", async () => {
+		const h = makeHarness({
+			coversUpToId: "raw-2",
+			observations: [
+				observation("2026-05-02T10:00:01"),
+				observation("2026-05-02T10:00:02"),
+				observation("2026-05-02T10:00:03"),
+				observation("2026-05-02T10:00:04"),
+			],
+		});
+		defaultFakeWorker({
+			// One acknowledged per run: three runs would be needed without the shutdown.
+			outcomes: (timestamps) => allPromoted(timestamps.slice(0, 1)),
+			onConsolidator: (attempt) => {
+				if (attempt !== 2) return;
+				h.runtime.enabled = false;
+				h.runtime.abortAllWorkers();
+			},
+		});
+
+		await h.handler("--flush");
+
+		expect(consolidatorCalls()).toHaveLength(2);
+		expect(foldLedger(h.branch).activeObservations).toHaveLength(3);
+		const report = h.notifications.at(-1)!;
+		expect(report.message).toContain("flush aborted");
+		expect(report.message).not.toContain("Safe to leave");
+	});
+
+	it("/om off during the foreign-lock wait cancels promptly without spawning", async () => {
+		process.env.PI_OM_FLUSH_LOCK_RETRY_MS = "20";
+		process.env.PI_OM_FLUSH_LOCK_WAIT_MS = "5000";
+		const h = makeHarness({ coversUpToId: "raw-2" });
+		defaultFakeWorker();
+		const foreign = acquireProjectLock(h.runtime.projectDir, { pid: process.pid, sessionId: "other" });
+		if (foreign === "busy") throw new Error("precondition failed: lock should have been free");
+		setTimeout(() => {
+			h.runtime.enabled = false;
+			h.runtime.abortAllWorkers();
+		}, 80);
+
+		try {
+			const started = Date.now();
+			await h.handler("--flush");
+			// Cancelled via the abort signal, well before the 5000ms lock wait would expire.
+			expect(Date.now() - started).toBeLessThan(3_000);
+			expect(consolidatorCalls()).toHaveLength(0);
+			const report = h.notifications.at(-1)!;
+			expect(report.message).toContain("flush aborted");
+			expect(report.message).not.toContain("Safe to leave");
+			// The foreign holder still owns the lock: the flush never acquired or released it.
+			expect(inspectProjectLock(h.runtime.projectDir)?.sessionId).toBe("other");
+		} finally {
+			releaseProjectLock(foreign);
+		}
+	});
+
+	it("a completed report that cannot tombstone stops after one run and never claims completion", async () => {
+		const h = makeHarness({ coversUpToId: "raw-2" });
+		// No source entries: tombstoneStillActive has no coversUpToId, so it drains nothing even
+		// though the worker reports a complete batch.
+		h.ctx.sessionManager.getBranch = () => h.branch.filter((entry) => entry.type !== "message");
+		defaultFakeWorker();
+
+		await h.handler("--flush");
+
+		expect(consolidatorCalls()).toHaveLength(1);
+		expect(foldLedger(h.branch).activeObservations).toHaveLength(3);
+		const report = h.notifications.at(-1)!;
+		expect(report.message).toContain("flush incomplete");
+		expect(report.message).not.toContain("Safe to leave");
 	});
 });

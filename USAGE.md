@@ -67,9 +67,16 @@ Thresholds may never fire in a short session. Before ending one, run:
 /om:consolidate --flush
 ```
 
-This is the only guaranteed publish: it observes the remaining conversation, consolidates
-the whole pool, and reports promoted / retained / discarded counts when done. If you skip
-it, observations stay in the session archive — kept, but not shared with future sessions.
+This explicitly publishes established knowledge: it observes the remaining conversation,
+consolidates the whole pool, and reports promoted / retained / discarded counts when done.
+If the worker omits an outcome, successfully reported observations are acknowledged while the
+missing ones stay active; flush retries only that remainder, up to three attempts and only
+while making progress. If it reports **incomplete**, the remaining observations are still
+active — rerun the command rather than assuming publication finished.
+
+`retained in archive` means preserved only in the session archive, not kept in the active
+pool or read by future sessions. If you skip flushing, unpublished observations are not
+shared with future sessions.
 
 ### 4. Review the bank when it gets noisy
 

@@ -5,7 +5,9 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { AGENT_EXTENSION_PATH, buildWorkerArgv, buildWorkerEnv, modelArg } from "../src/spawn/launch.js";
 import {
+	consolidatorBatchPath,
 	consolidatorResultPath,
+	readConsolidatorBatch,
 	readConsolidatorResult,
 	readObserverResult,
 	readReviewerResult,
@@ -13,6 +15,7 @@ import {
 	runCostPath,
 	runResultPath,
 	runsDir,
+	writeConsolidatorBatch,
 	writeConsolidatorResult,
 	writeObserverResult,
 	writeReviewerResult,
@@ -62,11 +65,12 @@ describe("launch argv + env", () => {
 	it("gives the consolidator the shared bank as OM_MEMORY_DIR, IPC under the runtime dir", () => {
 		const runtimeDir = "/proj/.memory/runtime/sess-1";
 		const projectDir = "/proj/.memory/project";
-		const env = buildWorkerEnv("consolidator", { runtimeDir, projectDir, runId: "c1", batchId: "batch-abc" });
+		const batchPath = consolidatorBatchPath(runtimeDir, "c1");
+		const env = buildWorkerEnv("consolidator", { runtimeDir, projectDir, runId: "c1", batchPath });
 		expect(env.OM_WORKER).toBe("consolidator");
 		expect(env.OM_MEMORY_DIR).toBe(projectDir);
-		// The batch id pins the outcome contract to the submitted batch.
-		expect(env.OM_BATCH_ID).toBe("batch-abc");
+		// The manifest pins the outcome contract to the submitted batch.
+		expect(env.OM_BATCH_PATH).toBe(batchPath);
 		// The consolidator's result file is the outcome contract, still under the runtime dir.
 		expect(env.OM_RESULT_PATH).toBe(consolidatorResultPath(runtimeDir, "c1"));
 		expect(env.OM_COST_PATH).toBe(runCostPath(runtimeDir, "c1"));
@@ -74,18 +78,14 @@ describe("launch argv + env", () => {
 
 	it("refuses a consolidator without the shared-bank sandbox root", () => {
 		expect(() =>
-			buildWorkerEnv("consolidator", { runtimeDir: "/proj/.memory/runtime/sess-1", runId: "c1", batchId: "batch-abc" }),
+			buildWorkerEnv("consolidator", { runtimeDir: "/proj/.memory/runtime/sess-1", runId: "c1" }),
 		).toThrow();
 	});
 
-	it("refuses a consolidator without a batch id", () => {
-		expect(() =>
-			buildWorkerEnv("consolidator", {
-				runtimeDir: "/proj/.memory/runtime/sess-1",
-				projectDir: "/proj/.memory/project",
-				runId: "c1",
-			}),
-		).toThrow(/batchId/);
+	it("refuses a consolidator without its authoritative index mapping", () => {
+		expect(() => buildWorkerEnv("consolidator", {
+			runtimeDir: "/runtime", projectDir: "/memory", runId: "c1",
+		})).toThrow(/batchPath/);
 	});
 
 	it("gives the reviewer mutable memory and read-only project roots plus a separate result contract", () => {
@@ -119,6 +119,9 @@ describe("launch argv + env", () => {
 		expect(consolidatorResultPath("/proj/.memory/runtime/sess-1", "c")).toBe(
 			"/proj/.memory/runtime/sess-1/runs/c.consolidation.json",
 		);
+		expect(consolidatorBatchPath("/proj/.memory/runtime/sess-1", "c")).toBe(
+			"/proj/.memory/runtime/sess-1/runs/c.batch.json",
+		);
 		expect(reviewerResultPath("/proj/.memory/runtime/sess-1", "v")).toBe(
 			"/proj/.memory/runtime/sess-1/runs/v.review.json",
 		);
@@ -132,6 +135,28 @@ describe("consolidator result IPC round-trip", () => {
 	});
 	afterEach(() => {
 		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("round-trips the authoritative ordered index mapping without normalizing timestamp ids", () => {
+		const path = join(dir, "c1.batch.json");
+		const batch = { batchId: "b1", timestamps: ["2026-06-25T14:30:00.01", "2026-06-25T14:30:00.10"] };
+		writeConsolidatorBatch(path, batch);
+		expect(readConsolidatorBatch(path)).toEqual(batch);
+	});
+
+	it.each([
+		null,
+		{ timestamps: ["t"] },
+		{ batchId: "", timestamps: ["t"] },
+		{ batchId: " ", timestamps: ["t"] },
+		{ batchId: "b1", timestamps: [] },
+		{ batchId: "b1", timestamps: ["t", "t"] },
+		{ batchId: "b1", timestamps: ["t", 1] },
+		{ batchId: "b1", timestamps: [" "] },
+	])("rejects malformed or ambiguous index mappings (%j)", (batch) => {
+		const path = join(dir, "bad.batch.json");
+		writeFileSync(path, JSON.stringify(batch));
+		expect(() => readConsolidatorBatch(path)).toThrow(/batch/);
 	});
 
 	it("writes and reads back a validated outcome report", () => {

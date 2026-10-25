@@ -12,6 +12,7 @@ vi.mock("../src/spawn/launch.js", async (importOriginal) => {
 });
 
 import { registerConsolidatorTools } from "../agent/consolidator/tools.js";
+import { registerConsolidatorOutcomeTool } from "../agent/consolidator/outcomes.js";
 import { DEFAULTS } from "../src/config.js";
 import {
 	deriveBatchId,
@@ -29,7 +30,7 @@ import { acquireProjectLock, inspectProjectLock, releaseProjectLock } from "../s
 import { indexPath } from "../src/memory/paths.js";
 import { Runtime } from "../src/runtime.js";
 import { buildWorkerEnv, spawnWorker } from "../src/spawn/launch.js";
-import { writeConsolidatorResult, type ConsolidatorOutcome } from "../src/spawn/runs.js";
+import { readConsolidatorBatch, writeConsolidatorResult, type ConsolidatorOutcome } from "../src/spawn/runs.js";
 import {
 	observation,
 	observationsRecordedEntry,
@@ -39,11 +40,17 @@ import {
 
 const spawnMock = vi.mocked(spawnWorker);
 
-/** Observation lines inside the kickoff prompt: "<timestamp>  <content>". */
-function parseBatchTimestamps(argv: string[]): string[] {
-	const prompt = argv[argv.indexOf("-p") + 1] ?? "";
-	const section = prompt.split("OBSERVATIONS TO CONSOLIDATE")[1] ?? "";
-	return [...section.matchAll(/^(\S+) {2}/gm)].map((match) => match[1] ?? "");
+/** The batch id the worker reads from its manifest. */
+function manifestBatchId(opts: { env: NodeJS.ProcessEnv }): string {
+	return readConsolidatorBatch(opts.env.OM_BATCH_PATH ?? "").batchId;
+}
+
+/** Resolve numbered prompt lines through the authoritative mapping, just like the worker tool. */
+function parseBatchTimestamps(opts: { argv: string[]; env: NodeJS.ProcessEnv }): string[] {
+	const prompt = opts.argv[opts.argv.indexOf("-p") + 1] ?? "";
+	const section = prompt.split("OBSERVATIONS TO CONSOLIDATE")[1]?.split("===== END OBSERVATIONS")[0] ?? "";
+	const batch = readConsolidatorBatch(opts.env.OM_BATCH_PATH ?? "");
+	return [...section.matchAll(/^(\d+) {2}/gm)].map((match) => batch.timestamps[Number(match[1]) - 1]!);
 }
 
 const allPromoted = (timestamps: string[]): ConsolidatorOutcome[] =>
@@ -66,10 +73,10 @@ function queueFakeWorker(behavior: FakeWorkerBehavior = {}): void {
 	spawnMock.mockImplementationOnce(async (opts) => {
 		behavior.onRun?.(opts);
 		if (!behavior.skipResult) {
-			const timestamps = parseBatchTimestamps(opts.argv);
+			const timestamps = parseBatchTimestamps(opts);
 			const outcomes = (behavior.outcomes ?? allPromoted)(timestamps);
 			writeConsolidatorResult(opts.env.OM_RESULT_PATH ?? "", {
-				batchId: behavior.batchIdOverride ?? opts.env.OM_BATCH_ID ?? "",
+				batchId: behavior.batchIdOverride ?? manifestBatchId(opts),
 				outcomes,
 			});
 		}
@@ -168,9 +175,9 @@ beforeEach(() => {
 	spawnMock.mockReset();
 	// Default fake worker: exit 0 with a complete, honest outcome report.
 	spawnMock.mockImplementation(async (opts) => {
-		const timestamps = parseBatchTimestamps(opts.argv);
+		const timestamps = parseBatchTimestamps(opts);
 		writeConsolidatorResult(opts.env.OM_RESULT_PATH ?? "", {
-			batchId: opts.env.OM_BATCH_ID ?? "",
+			batchId: manifestBatchId(opts),
 			outcomes: allPromoted(timestamps),
 		});
 		return { code: 0, signal: null, stderr: "" };
@@ -189,22 +196,22 @@ describe("buildWorkerEnv(consolidator)", () => {
 			runtimeDir: "/proj/.memory/runtime/sess-1",
 			projectDir: "/proj/.memory/project",
 			runId: "c1",
-			batchId: "batch-abc",
+			batchPath: "/proj/.memory/runtime/sess-1/runs/c1.batch.json",
 		});
 		expect(env.OM_WORKER).toBe("consolidator");
 		expect(env.OM_RUN_ID).toBe("c1");
 		expect(env.OM_MEMORY_DIR).toBe("/proj/.memory/project");
-		expect(env.OM_BATCH_ID).toBe("batch-abc");
+		expect(env.OM_BATCH_PATH).toBe("/proj/.memory/runtime/sess-1/runs/c1.batch.json");
 	});
 
-	it("refuses a consolidator without a batch id", () => {
+	it("refuses a consolidator without a batch manifest", () => {
 		expect(() =>
 			buildWorkerEnv("consolidator", {
 				runtimeDir: "/proj/.memory/runtime/sess-1",
 				projectDir: "/proj/.memory/project",
 				runId: "c1",
 			}),
-		).toThrow(/batchId/);
+		).toThrow(/batchPath/);
 	});
 });
 
@@ -237,10 +244,10 @@ describe("dispatchConsolidator (§7d ordering)", () => {
 		});
 		expect(foldLedger(h.branch).archivedBatches).toHaveLength(1);
 
-		// Step 4: the worker got the batch id in env and prompt; nothing dated anywhere.
+		// Step 4: the worker got the batch id in its manifest and prompt; nothing dated anywhere.
 		expect(spawnMock).toHaveBeenCalledTimes(1);
 		const call = spawnMock.mock.calls[0]!;
-		expect(call[0].env.OM_BATCH_ID).toBe(batchId);
+		expect(manifestBatchId(call[0])).toBe(batchId);
 		const prompt = call[0].argv[call[0].argv.indexOf("-p") + 1] as string;
 		expect(prompt).toContain(`"${batchId}"`);
 		expect(prompt).toContain("report_consolidation_outcomes");
@@ -257,9 +264,9 @@ describe("dispatchConsolidator (§7d ordering)", () => {
 		expect(h.runtime.consolidatorInFlight).toBe(false);
 	});
 
-	it("archives before drain: the archive file survives a failed worker and the batch stays active", async () => {
+	it.each([false, true])("a nonzero exit preserves the batch despite a persisted report (partial=%s)", async (partial) => {
 		const h = makeHarness();
-		queueFakeWorker({ exitCode: 1 });
+		queueFakeWorker({ exitCode: 1, outcomes: (timestamps) => allPromoted(partial ? timestamps.slice(0, 1) : timestamps) });
 		await dispatchConsolidator(h.pi, h.runtime, h.ctx, h.observations);
 
 		const batchId = deriveBatchId("sess-1", h.observations.map((o) => o.timestamp));
@@ -272,6 +279,32 @@ describe("dispatchConsolidator (§7d ordering)", () => {
 		expect(foldLedger(h.branch).activeObservations).toHaveLength(3);
 		expect(inspectProjectLock(h.runtime.projectDir)).toBeUndefined();
 		expect(h.runtime.lastWorkerError).toContain("code 1");
+	});
+
+	it.each([false, true])("an aborted lock acquisition prevents spawning and releases any acquired lock (busy=%s)", async (busy) => {
+		const h = makeHarness();
+		const result = await dispatchConsolidator(h.pi, h.runtime, h.ctx, h.observations, {
+			acquireLock: async (projectDir, owner) => {
+				const lock = busy ? "busy" : acquireProjectLock(projectDir, owner);
+				h.runtime.abortAllWorkers();
+				return lock;
+			},
+		});
+		expect(result.outcome).toBe("failed");
+		expect(spawnMock).not.toHaveBeenCalled();
+		expect(foldLedger(h.branch).activeObservations).toHaveLength(3);
+		expect(inspectProjectLock(h.runtime.projectDir)).toBeUndefined();
+	});
+
+	it("an aborted worker cannot drain even if it returns a valid report and exits zero", async () => {
+		const h = makeHarness();
+		queueFakeWorker({ onRun: () => h.runtime.abortAllWorkers() });
+		const result = await dispatchConsolidator(h.pi, h.runtime, h.ctx, h.observations);
+		expect(result.outcome).toBe("failed");
+		expect(result.error).toMatch(/aborted/i);
+		expect(droppedEntry(h.branch)).toBeUndefined();
+		expect(foldLedger(h.branch).activeObservations).toHaveLength(3);
+		expect(inspectProjectLock(h.runtime.projectDir)).toBeUndefined();
 	});
 
 	it("deterministic batchId: a retry of the same batch reuses the same archive name (idempotent, merges in the fold)", async () => {
@@ -336,10 +369,6 @@ describe("dispatchConsolidator (§7d ordering)", () => {
 			{ batchIdOverride: "deadbeefdeadbeef" },
 		],
 		[
-			"missing timestamp",
-			{ outcomes: (timestamps: string[]) => allPromoted(timestamps.slice(1)) },
-		],
-		[
 			"extra unknown timestamp",
 			{
 				outcomes: (timestamps: string[]) => [
@@ -366,6 +395,87 @@ describe("dispatchConsolidator (§7d ordering)", () => {
 		expect(foldLedger(h.branch).activeObservations).toHaveLength(3);
 		expect(inspectProjectLock(h.runtime.projectDir)).toBeUndefined();
 		expect(h.runtime.lastWorkerError).toContain("outcome validation failed");
+	});
+
+	it("partially drains only explicitly acknowledged observations, after publishing INDEX", async () => {
+		const h = makeHarness();
+		queueFakeWorker({ outcomes: (timestamps) => [
+			{ timestamp: timestamps[0]!, disposition: "promoted" },
+			{ timestamp: timestamps[2]!, disposition: "retained" },
+		] });
+
+		const result = await dispatchConsolidator(h.pi, h.runtime, h.ctx, h.observations);
+
+		expect(result.outcome).toBe("partial");
+		expect(result.counts).toEqual({ promoted: 1, retained: 1, discarded: 0 });
+		expect(result.drained).toBe(2);
+		expect(droppedEntry(h.branch)?.data.observationTimestamps).toEqual([
+			h.observations[0]!.timestamp, h.observations[2]!.timestamp,
+		]);
+		expect(foldLedger(h.branch).activeObservations.map((o) => o.timestamp)).toEqual([h.observations[1]!.timestamp]);
+		expect(existsSync(indexPath(h.runtime.projectDir))).toBe(true);
+		expect(inspectProjectLock(h.runtime.projectDir)).toBeUndefined();
+	});
+
+	it("an empty valid report makes no progress and never defaults unreported dispositions", async () => {
+		const h = makeHarness();
+		queueFakeWorker({ outcomes: () => [] });
+		const result = await dispatchConsolidator(h.pi, h.runtime, h.ctx, h.observations);
+		expect(result.outcome).toBe("partial");
+		expect(result.counts).toEqual({ promoted: 0, retained: 0, discarded: 0 });
+		expect(droppedEntry(h.branch)).toBeUndefined();
+		expect(foldLedger(h.branch).activeObservations).toHaveLength(3);
+	});
+
+	it("screens secrets even when only part of the safe batch is acknowledged", async () => {
+		const observations = [
+			observation("2026-05-02T10:00:01"),
+			observation("2026-05-02T10:00:02", { content: "password=hunter2secretvalue" }),
+			observation("2026-05-02T10:00:03"),
+		];
+		const h = makeHarness({ observations });
+		queueFakeWorker({ outcomes: (timestamps) => allPromoted(timestamps.slice(0, 1)) });
+		const result = await dispatchConsolidator(h.pi, h.runtime, h.ctx, observations);
+		expect(result.outcome).toBe("partial");
+		expect(result.screened).toBe(1);
+		expect(result.drained).toBe(2);
+		expect(foldLedger(h.branch).activeObservations.map((o) => o.timestamp)).toEqual([observations[2]!.timestamp]);
+	});
+
+	it.each([false, true])("maps indices through the real tool and salvages missing reports (repair=%s)", async (repair) => {
+		const h = makeHarness({ observations: [
+			observation("2026-05-02T10:00:00.10", { content: "tenth fact" }),
+			observation("2026-05-02T10:00:00", { content: "base fact" }),
+			observation("2026-05-02T10:00:00.01", { content: "first fact" }),
+		] });
+		spawnMock.mockImplementationOnce(async (opts) => {
+			const batch = readConsolidatorBatch(opts.env.OM_BATCH_PATH!);
+			const prompt = opts.argv[opts.argv.indexOf("-p") + 1]!;
+			expect(batch.timestamps).toEqual([
+				"2026-05-02T10:00:00", "2026-05-02T10:00:00.01", "2026-05-02T10:00:00.10",
+			]);
+			expect(prompt).toContain("1  base fact\n2  first fact\n3  tenth fact");
+			expect(prompt).not.toContain("2026-05-02T10:00:00");
+			let tool: any;
+			registerConsolidatorOutcomeTool({ registerTool: (def: any) => { tool = def; } } as any,
+				opts.env.OM_RESULT_PATH!, batch);
+			await expect(tool.execute("first", { batchId: batch.batchId, outcomes: [
+				{ index: 1, disposition: "promoted" }, { index: 3, disposition: "retained" },
+			] })).rejects.toThrow(/Missing indices: 2\./);
+			if (repair) {
+				const complete = await tool.execute("repair", {
+					batchId: batch.batchId, outcomes: [{ index: 2, disposition: "discarded" }],
+				});
+				expect(complete.details.total).toBe(3);
+			}
+			return { code: 0, signal: null, stderr: "" };
+		});
+
+		const result = await dispatchConsolidator(h.pi, h.runtime, h.ctx, h.observations);
+		expect(result.outcome).toBe(repair ? "completed" : "partial");
+		expect(result.counts).toEqual({ promoted: 1, retained: 1, discarded: repair ? 1 : 0 });
+		expect(foldLedger(h.branch).activeObservations.map((o) => o.timestamp))
+			.toEqual(repair ? [] : ["2026-05-02T10:00:00.01"]);
 	});
 
 	it("tombstones only timestamps still active on the branch — an observation committed mid-run survives", async () => {
@@ -511,9 +621,9 @@ describe("dispatchConsolidator (§7d ordering)", () => {
 			releaseGate = resolve;
 		});
 		spawnMock.mockImplementationOnce(async (opts) => {
-			const timestamps = parseBatchTimestamps(opts.argv);
+			const timestamps = parseBatchTimestamps(opts);
 			writeConsolidatorResult(opts.env.OM_RESULT_PATH ?? "", {
-				batchId: opts.env.OM_BATCH_ID ?? "",
+				batchId: manifestBatchId(opts),
 				outcomes: allPromoted(timestamps),
 			});
 			await gate; // first consolidator still running
@@ -598,6 +708,22 @@ describe("validateConsolidatorOutcomes", () => {
 		expect(() =>
 			validateConsolidatorOutcomes({ batchId: "other", outcomes: allPromoted(submitted) }, "b1", submitted),
 		).toThrow(/batchId/);
+	});
+
+	it("returns explicit missing ids without adding default dispositions", () => {
+		const result = validateConsolidatorOutcomes({ batchId: "b1", outcomes: allPromoted(submitted.slice(0, 1)) }, "b1", submitted);
+		expect(result).toEqual({
+			counts: { promoted: 1, retained: 0, discarded: 0 },
+			acknowledgedTimestamps: submitted.slice(0, 1),
+			missingTimestamps: submitted.slice(1),
+		});
+	});
+
+	it.each([
+		[[...allPromoted(submitted), ...allPromoted(submitted.slice(0, 1))], /duplicate/],
+		[[...allPromoted(submitted), ...allPromoted(["unknown"])], /unknown/],
+	] as const)("still rejects malformed accounting (%j)", (outcomes, error) => {
+		expect(() => validateConsolidatorOutcomes({ batchId: "b1", outcomes: [...outcomes] }, "b1", submitted)).toThrow(error);
 	});
 });
 
