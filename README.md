@@ -130,6 +130,16 @@ flowchart LR
   source, inspect `.memory` through its project tools, or read common secret paths. Review runs
   under the same project lock as consolidation. The orchestrator validates the reviewer's exact
   per-file completion report and final topic front-matter, then regenerates INDEX.md.
+  Project list/grep/read responses are capped at 50 KiB including notices. Grep returns at most
+  200 matching lines, with long lines shown as marked 500-character excerpts around the first
+  match (including original byte size and Unicode column range). Reads return up to 400 lines;
+  oversized lines are paginated with an explicit line offset and Unicode character column,
+  rather than bypassing the byte cap. Limited searches are explicitly marked as non-exhaustive.
+  Directory greps skip untracked git-ignored paths (such as training `runs/`) unless one is
+  passed explicitly as the search path, and every grep reports how many git-ignored, over-1 MB,
+  or binary/unreadable files it did not search.
+  A worker that exits without its completion report is reported as a failed review, even if
+  it wrote cost telemetry or exited with code zero.
 - **Compaction** (`turn_end` at `compactAtContextPercent` of the active model window):
   deterministic and model-free. It waits for in-flight observers (or provably skips the wait
   when none can affect the result), snaps the cutoff to an observation chunk boundary, and

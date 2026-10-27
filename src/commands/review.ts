@@ -195,7 +195,15 @@ export async function runMemoryReview(
 			if (exit.code !== 0) {
 				throw new Error(`reviewer exited with code ${exit.code}${exit.stderr ? `: ${exit.stderr.trim().slice(0, 200)}` : ""}`);
 			}
-			const result = readReviewerResult(reviewerResultPath(runtime.runtimeDir, runId));
+			let result: ReviewerRunResult;
+			try {
+				result = readReviewerResult(reviewerResultPath(runtime.runtimeDir, runId));
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+					throw new Error(`reviewer exited without submitting a review report (run ${runId})`);
+				}
+				throw error;
+			}
 			const { counts } = validateReviewerResult(result, runId, initialFiles, runtime.projectDir);
 			atomicWrite(indexPath(runtime.projectDir), renderIndexFile(listTopics(runtime.projectDir, ctx.cwd)));
 			debugLog("review.complete", { runId, counts });

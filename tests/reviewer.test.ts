@@ -14,7 +14,7 @@ import { runMemoryReview, validateReviewerResult } from "../src/commands/review.
 import { inspectProjectLock } from "../src/memory/lock.js";
 import { Runtime } from "../src/runtime.js";
 import { spawnWorker } from "../src/spawn/launch.js";
-import { writeReviewerResult } from "../src/spawn/runs.js";
+import { writeReviewerResult, writeWorkerCost } from "../src/spawn/runs.js";
 
 const spawnMock = vi.mocked(spawnWorker);
 const tempDirs: string[] = [];
@@ -130,6 +130,56 @@ describe("manual reviewer orchestration", () => {
 		const prompt = call.argv[call.argv.indexOf("-p") + 1]!;
 		expect(prompt).toContain("OVERVIEW.md");
 		expect(prompt).toContain("stale.md");
+	});
+
+	it("reports a missing report clearly even when the worker exits zero and writes its cost", async () => {
+		const h = makeHarness();
+		spawnMock.mockImplementationOnce(async (opts) => {
+			writeFileSync(join(opts.env.OM_MEMORY_DIR!, "OVERVIEW.md"), "Partially changed.\n", "utf-8");
+			writeWorkerCost(opts.env.OM_COST_PATH!, { costUsd: 0.125 });
+			return { code: 0, signal: null, stderr: "" };
+		});
+
+		const result = await runMemoryReview(h.pi, h.runtime, h.ctx);
+
+		expect(result.outcome).toBe("failed");
+		expect(result.error).toContain("reviewer exited without submitting a review report");
+		expect(result.error).not.toContain("ENOENT");
+		expect(h.runtime.lastWorkerError).toBe(result.error);
+		expect(readFileSync(join(h.projectDir, "OVERVIEW.md"), "utf-8")).toBe("Partially changed.\n");
+		expect(existsSync(join(h.projectDir, "INDEX.md"))).toBe(false);
+		expect(inspectProjectLock(h.projectDir)).toBeUndefined();
+		expect(h.runtime.reviewerController).toBeUndefined();
+		expect(h.ctx.sessionManager.getEntries()).toEqual(expect.arrayContaining([
+			expect.objectContaining({ data: expect.objectContaining({ role: "reviewer", costUsd: 0.125 }) }),
+		]));
+	});
+
+	it("preserves malformed-report errors instead of calling them missing reports", async () => {
+		const h = makeHarness();
+		spawnMock.mockImplementationOnce(async (opts) => {
+			writeWorkerCost(opts.env.OM_COST_PATH!, { costUsd: 0 }); // Ensure the runs directory exists.
+			writeFileSync(opts.env.OM_RESULT_PATH!, "{invalid JSON", "utf-8");
+			return { code: 0, signal: null, stderr: "" };
+		});
+
+		const result = await runMemoryReview(h.pi, h.runtime, h.ctx);
+
+		expect(result.outcome).toBe("failed");
+		expect(result.error).toBeTruthy();
+		expect(result.error).not.toContain("without submitting a review report");
+		expect(inspectProjectLock(h.projectDir)).toBeUndefined();
+	});
+
+	it("preserves nonzero worker exit diagnostics even when no report exists", async () => {
+		const h = makeHarness();
+		spawnMock.mockResolvedValueOnce({ code: 1, signal: null, stderr: "worker startup failed" });
+
+		const result = await runMemoryReview(h.pi, h.runtime, h.ctx);
+
+		expect(result.outcome).toBe("failed");
+		expect(result.error).toBe("reviewer exited with code 1: worker startup failed");
+		expect(inspectProjectLock(h.projectDir)).toBeUndefined();
 	});
 
 	it("reports failure without rolling back edits when the terminal report is incomplete", async () => {

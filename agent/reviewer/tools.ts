@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import {
 	existsSync,
 	lstatSync,
@@ -8,16 +9,19 @@ import {
 	unlinkSync,
 } from "node:fs";
 import { basename, isAbsolute, relative, resolve } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Static } from "typebox";
 import { atomicWrite } from "../../src/memory/paths.js";
 import { fail, ok, type ToolText } from "../tool-text.js";
 
 const MAX_READ_LINES = 400;
-const MAX_READ_CHARS = 50_000;
 const MAX_GREP_HITS = 200;
+const MAX_GREP_LINE_CHARS = 500;
 const MAX_GREP_FILE_BYTES = 1_000_000;
+const MAX_OUTPUT_BYTES = DEFAULT_MAX_BYTES;
+// Leave room for the bounded status/continuation notices inside the response byte cap.
+const MAX_CONTENT_BYTES = MAX_OUTPUT_BYTES - 512;
 const TOPIC_FILENAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*\.md$/;
 
 const ReadMemorySchema = Type.Object({
@@ -42,6 +46,7 @@ const ProjectPathSchema = Type.Object({
 const ProjectReadSchema = Type.Object({
 	path: Type.String({ description: "Project-relative file path." }),
 	offset: Type.Optional(Type.Integer({ minimum: 1, description: "First line to return (1-indexed). Defaults to 1." })),
+	column: Type.Optional(Type.Integer({ minimum: 1, description: "First Unicode character in the first returned line (1-indexed). Defaults to 1. Use the continuation column to resume a truncated long line." })),
 	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_READ_LINES, description: `Maximum lines to return (up to ${MAX_READ_LINES}).` })),
 });
 const ProjectGrepSchema = Type.Object({
@@ -123,7 +128,38 @@ function scopedProjectPath(root: string, requested: string): { abs: string; rel:
 	return { abs: real, rel: lexicalRel };
 }
 
-function collectProjectFiles(root: string, start: string, out: string[]): void {
+/**
+ * Git-ignored, untracked paths under the project root, relative to it with `/` separators.
+ * Fully ignored directories collapse to one `dir/` entry. Empty outside a git work tree.
+ */
+function listGitIgnored(root: string): Set<string> {
+	try {
+		const out = execFileSync("git", ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"], {
+			cwd: root,
+			encoding: "utf-8",
+			stdio: ["ignore", "pipe", "ignore"],
+			maxBuffer: 64 * 1024 * 1024,
+			timeout: 10_000,
+		});
+		return new Set(out.split("\0").filter(Boolean));
+	} catch {
+		return new Set();
+	}
+}
+
+function gitIgnoredPath(ignored: Set<string>, rel: string): boolean {
+	if (ignored.size === 0 || !rel || rel === ".") return false;
+	const segments = rel.split(/[\\/]/);
+	let prefix = "";
+	for (let i = 0; i < segments.length; i++) {
+		prefix = i === 0 ? segments[0]! : `${prefix}/${segments[i]}`;
+		if (ignored.has(`${prefix}/`)) return true;
+	}
+	return ignored.has(prefix);
+}
+
+/** Collect searchable files below `start`; `skip` prunes extra entries (e.g. git-ignored ones). */
+function collectProjectFiles(root: string, start: string, out: string[], skip?: (rel: string) => boolean): void {
 	let entries;
 	try {
 		entries = readdirSync(start, { withFileTypes: true });
@@ -134,31 +170,79 @@ function collectProjectFiles(root: string, start: string, out: string[]): void {
 		const abs = resolve(start, entry.name);
 		const rel = relative(root, abs);
 		if (deniedProjectPath(rel) || entry.isSymbolicLink()) continue;
-		if (entry.isDirectory()) collectProjectFiles(root, abs, out);
+		if (skip?.(rel)) continue;
+		if (entry.isDirectory()) collectProjectFiles(root, abs, out, skip);
 		else if (entry.isFile()) out.push(abs);
 	}
 }
 
-function readLines(path: string, offset: number, limit: number): { text: string; truncated: boolean; nextOffset?: number } {
+function plural(count: number, noun: string): string {
+	return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+/** Keep a UTF-8 prefix without splitting a multibyte character. */
+function bytePrefix(text: string, maxBytes: number): string {
+	const bytes = Buffer.from(text, "utf-8");
+	if (bytes.length <= maxBytes) return text;
+	let end = maxBytes;
+	while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end--;
+	return bytes.subarray(0, end).toString("utf-8");
+}
+
+function fromColumn(line: string, column: number): string {
+	let index = 0;
+	let current = 1;
+	for (const char of line) {
+		if (current >= column) break;
+		index += char.length;
+		current++;
+	}
+	return line.slice(index);
+}
+
+function readLines(path: string, offset: number, limit: number, column: number): string {
 	const lines = readFileSync(path, "utf-8").split("\n");
 	const start = Math.min(lines.length, Math.max(0, offset - 1));
 	const selected: string[] = [];
-	let chars = 0;
+	let bytes = 0;
 	for (let i = start; i < lines.length && selected.length < limit; i++) {
-		const line = lines[i] ?? "";
-		if (selected.length > 0 && chars + line.length + 1 > MAX_READ_CHARS) break;
+		const original = lines[i] ?? "";
+		const line = i === start ? fromColumn(original, column) : original;
+		const lineBytes = Buffer.byteLength(line, "utf-8");
+		const separatorBytes = selected.length > 0 ? 1 : 0;
+		if (bytes + separatorBytes + lineBytes > MAX_CONTENT_BYTES) {
+			if (selected.length > 0) break;
+			const preview = bytePrefix(line, MAX_CONTENT_BYTES);
+			const nextColumn = column + Array.from(preview).length;
+			return `${preview}\n\n[truncated within line ${i + 1} (${Buffer.byteLength(original, "utf-8")} bytes total); continue with offset ${i + 1}, column ${nextColumn}]`;
+		}
 		selected.push(line);
-		chars += line.length + 1;
+		bytes += separatorBytes + lineBytes;
 	}
-	const consumed = selected.length;
-	const truncated = start + consumed < lines.length;
-	return { text: selected.join("\n"), truncated, nextOffset: truncated ? start + consumed + 1 : undefined };
+	const next = start + selected.length;
+	const suffix = next < lines.length ? `\n\n[truncated; continue with offset ${next + 1}]` : "";
+	return `${selected.join("\n")}${suffix}`;
+}
+
+/** Show the first match in context, even when it occurs deep inside a huge line. */
+function grepPreview(line: string, matchIndex: number): string {
+	if (line.length <= MAX_GREP_LINE_CHARS) return line;
+	const chars = Array.from(line);
+	if (chars.length <= MAX_GREP_LINE_CHARS) return line;
+	const matchColumn = Array.from(line.slice(0, matchIndex)).length;
+	const start = Math.max(0, Math.min(matchColumn - Math.floor(MAX_GREP_LINE_CHARS / 2), chars.length - MAX_GREP_LINE_CHARS));
+	const end = start + MAX_GREP_LINE_CHARS;
+	const preview = chars.slice(start, end).join("");
+	return `${start > 0 ? "…" : ""}${preview}${end < chars.length ? "…" : ""} [line truncated: ${Buffer.byteLength(line, "utf-8")} bytes; columns ${start + 1}-${end} of ${chars.length}]`;
 }
 
 /** Register reviewer tools: mutable memory-bank tools plus read-only, secret-aware project inspection. */
 export function registerReviewerTools(pi: ExtensionAPI, memoryRoot: string, projectRoot: string): void {
 	const memory = resolve(memoryRoot);
 	const project = realpathSync(resolve(projectRoot));
+	// The project is read-only during review, so the ignore set is computed once on first grep.
+	let ignoredPaths: Set<string> | undefined;
+	const gitIgnored = (rel: string): boolean => gitIgnoredPath((ignoredPaths ??= listGitIgnored(project)), rel);
 
 	pi.registerTool({
 		name: "memory_list",
@@ -238,7 +322,7 @@ export function registerReviewerTools(pi: ExtensionAPI, memoryRoot: string, proj
 	pi.registerTool({
 		name: "project_list",
 		label: "List project files",
-		description: "List a project directory read-only. Memory, VCS internals, dependencies, generated output, and likely secret paths are excluded.",
+		description: `List a project directory read-only (up to ${MAX_OUTPUT_BYTES / 1024} KiB including notices). Memory, VCS internals, dependencies, generated output, and likely secret paths are excluded.`,
 		parameters: ProjectPathSchema,
 		async execute(_id: string, params: ProjectPathInput): Promise<ToolText> {
 			const p = scopedProjectPath(project, params.path ?? ".");
@@ -248,14 +332,26 @@ export function registerReviewerTools(pi: ExtensionAPI, memoryRoot: string, proj
 				.filter((entry) => !deniedProjectPath(relative(project, resolve(p.abs, entry.name))))
 				.map((entry) => `${entry.name}${entry.isDirectory() ? "/" : ""}`)
 				.sort();
-			return ok(entries.length > 0 ? entries.join("\n") : "(empty)");
+			if (entries.length === 0) return ok("(empty)");
+			const shown: string[] = [];
+			let bytes = 0;
+			for (const entry of entries) {
+				const entryBytes = Buffer.byteLength(entry, "utf-8") + (shown.length > 0 ? 1 : 0);
+				if (bytes + entryBytes > MAX_CONTENT_BYTES) break;
+				shown.push(entry);
+				bytes += entryBytes;
+			}
+			const suffix = shown.length < entries.length
+				? `\n\n[listing truncated at ${MAX_OUTPUT_BYTES / 1024} KiB limit: showing ${shown.length} of ${entries.length} entries. List a subdirectory or grep a narrower path.]`
+				: "";
+			return ok(`${shown.join("\n")}${suffix}`);
 		},
 	});
 
 	pi.registerTool({
 		name: "project_read",
 		label: "Read project file",
-		description: `Read a bounded slice of a project file, read-only (up to ${MAX_READ_LINES} lines / ${MAX_READ_CHARS} characters).`,
+		description: `Read a bounded slice of a project file, read-only (up to ${MAX_READ_LINES} lines / ${MAX_OUTPUT_BYTES / 1024} KiB including notices). Truncation is marked; use the returned offset and optional column to continue, including within a long line.`,
 		parameters: ProjectReadSchema,
 		async execute(_id: string, params: ProjectReadInput): Promise<ToolText> {
 			const p = scopedProjectPath(project, params.path);
@@ -264,9 +360,7 @@ export function registerReviewerTools(pi: ExtensionAPI, memoryRoot: string, proj
 			const offset = params.offset ?? 1;
 			const limit = Math.min(params.limit ?? MAX_READ_LINES, MAX_READ_LINES);
 			try {
-				const result = readLines(p.abs, offset, limit);
-				const suffix = result.truncated ? `\n\n[truncated; continue with offset ${result.nextOffset}]` : "";
-				return ok(`${result.text}${suffix}`);
+				return ok(readLines(p.abs, offset, limit, params.column ?? 1));
 			} catch {
 				return fail("file is not readable as UTF-8 text");
 			}
@@ -276,39 +370,82 @@ export function registerReviewerTools(pi: ExtensionAPI, memoryRoot: string, proj
 	pi.registerTool({
 		name: "project_grep",
 		label: "Search project files",
-		description: `Search project text files read-only with a JavaScript regular expression (up to ${MAX_GREP_HITS} hits). Excluded paths are never searched.`,
+		description: `Search project text files read-only with a JavaScript regular expression (up to ${MAX_GREP_HITS} hits / ${MAX_OUTPUT_BYTES / 1024} KiB including notices). Long matching lines show at most ${MAX_GREP_LINE_CHARS} characters around the first match, marked with original size and Unicode column range. Use project_read with offset/column for more. Excluded paths are never searched. Directory searches skip git-ignored paths unless you pass an ignored path explicitly; files over ${MAX_GREP_FILE_BYTES / 1_000_000} MB and binary files are skipped. Skipped paths are counted in a notice.`,
 		parameters: ProjectGrepSchema,
 		async execute(_id: string, params: ProjectGrepInput): Promise<ToolText> {
 			let re: RegExp;
 			try {
 				re = new RegExp(params.pattern);
 			} catch (error) {
-				return fail(`invalid regex: ${(error as Error).message}`);
+				const message = (error as Error).message;
+				const preview = bytePrefix(message, MAX_CONTENT_BYTES);
+				return fail(`invalid regex: ${preview}${preview.length < message.length ? " [truncated]" : ""}`);
 			}
 			const p = scopedProjectPath(project, params.path ?? ".");
 			if (!p) return fail("path is missing, outside the project, or excluded for safety");
 			const files: string[] = [];
-			if (statSync(p.abs).isDirectory()) collectProjectFiles(project, p.abs, files);
-			else files.push(p.abs);
+			let skippedIgnored = 0;
+			let skippedLarge = 0;
+			let skippedBinary = 0;
+			if (statSync(p.abs).isDirectory()) {
+				// Searching inside an explicitly requested ignored directory is an opt-in, so only
+				// prune ignored descendants when the starting directory itself is not ignored.
+				const skip = gitIgnored(p.rel)
+					? undefined
+					: (rel: string): boolean => {
+						if (!gitIgnored(rel)) return false;
+						skippedIgnored++;
+						return true;
+					};
+				collectProjectFiles(project, p.abs, files, skip);
+			} else files.push(p.abs);
 			const hits: string[] = [];
+			let outputBytes = 0;
+			let byteLimitReached = false;
 			for (const file of files) {
 				try {
-					if (statSync(file).size > MAX_GREP_FILE_BYTES) continue;
+					if (statSync(file).size > MAX_GREP_FILE_BYTES) {
+						skippedLarge++;
+						continue;
+					}
 					const text = readFileSync(file, "utf-8");
-					if (text.includes("\0")) continue;
+					if (text.includes("\0")) {
+						skippedBinary++;
+						continue;
+					}
 					const lines = text.split("\n");
 					for (let i = 0; i < lines.length; i++) {
+						const line = (lines[i] ?? "").replace(/\r$/, "");
 						re.lastIndex = 0;
-						if (re.test(lines[i] ?? "")) hits.push(`${relative(project, file)}:${i + 1}: ${(lines[i] ?? "").trim()}`);
+						const match = re.exec(line);
+						if (!match) continue;
+						const hit = `${relative(project, file)}:${i + 1}: ${grepPreview(line, match.index)}`;
+						const hitBytes = Buffer.byteLength(hit, "utf-8") + (hits.length > 0 ? 1 : 0);
+						if (outputBytes + hitBytes > MAX_CONTENT_BYTES) {
+							byteLimitReached = true;
+							break;
+						}
+						hits.push(hit);
+						outputBytes += hitBytes;
 						if (hits.length >= MAX_GREP_HITS) break;
 					}
 				} catch {
-					// Ignore unreadable/non-text project files.
+					// Unreadable project files are reported with binary ones.
+					skippedBinary++;
 				}
-				if (hits.length >= MAX_GREP_HITS) break;
+				if (byteLimitReached || hits.length >= MAX_GREP_HITS) break;
 			}
-			const suffix = hits.length >= MAX_GREP_HITS ? `\n[limited to ${MAX_GREP_HITS} hits]` : "";
-			return ok(hits.length > 0 ? `${hits.join("\n")}${suffix}` : "(no matches)");
+			const notices: string[] = [];
+			if (byteLimitReached) notices.push(`output truncated at ${MAX_OUTPUT_BYTES / 1024} KiB limit`);
+			if (hits.length >= MAX_GREP_HITS) notices.push(`limited to ${MAX_GREP_HITS} hits`);
+			const skipped: string[] = [];
+			if (skippedIgnored > 0) skipped.push(`${plural(skippedIgnored, "git-ignored path")} (pass one as path to search it)`);
+			if (skippedLarge > 0) skipped.push(`${plural(skippedLarge, "file")} over ${MAX_GREP_FILE_BYTES / 1_000_000} MB`);
+			if (skippedBinary > 0) skipped.push(`${plural(skippedBinary, "binary or unreadable file")}`);
+			let suffix = notices.length > 0 ? `\n\n[${notices.join("; ")}; additional matches may exist. Narrow the pattern or path.]` : "";
+			if (skipped.length > 0) suffix += `${suffix ? "\n" : "\n\n"}[not searched: ${skipped.join(", ")}]`;
+			const body = hits.length > 0 ? hits.join("\n") : byteLimitReached ? "(no matches fit within output limit)" : "(no matches)";
+			return ok(`${body}${suffix}`);
 		},
 	});
 }
